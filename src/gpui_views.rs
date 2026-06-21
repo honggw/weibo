@@ -6,6 +6,7 @@
 //!   Login flow runs on a tokio runtime, updates view via context.spawn()
 
 use gpui::*;
+use gpui::prelude::*;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -39,8 +40,8 @@ enum AppState {
     CheckingCookie,
     /// Initial: warmup + fetching QR code
     Loading { status: String },
-    /// QR code ready, waiting for scan
-    WaitingScan { status: String, qr_path: Option<PathBuf> },
+    /// QR code ready, waiting for scan (png_bytes stored for in-window display)
+    WaitingScan { status: String, qr_png_bytes: Option<Vec<u8>> },
     /// Login confirmed, exchanging ticket
     Exchanging { status: String },
     /// Fetching timeline from API
@@ -220,181 +221,174 @@ impl AppRoot {
     // ========================================================================
 
     /// Spawn the full login flow (warmup → QR → poll → exchange → save cookies → timeline)
+    /// Uses short block_on calls with yields between them so GPUI can render.
     fn start_login_flow(&self, cx: &Context<Self>) {
         let tokio_handle = self.tokio_handle.clone();
 
         cx.spawn(|this: WeakEntity<AppRoot>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
-            let result: Result<(), anyhow::Error> = tokio_handle.block_on(async {
-                // --- Step 1: Init + warmup ---
-                this.update(&mut cx, |v, cx| {
-                    v.state = AppState::Loading {
-                        status: "正在连接微博...".into(),
-                    };
-                    cx.notify();
-                })
-                .ok();
 
+            // --- Phase 1: warmup + fetch QR (one fast block_on) ---
+            let init_result: Result<(QrLogin, Vec<u8>), anyhow::Error> = tokio_handle.block_on(async {
                 let mut login = QrLogin::new()?;
-                log_info!("[login] 正在 warmup...");
                 login.warmup().await?;
-                log_success!("[login] warmup 完成");
-
-                // --- Step 2: Fetch QR code ---
-                this.update(&mut cx, |v, cx| {
-                    v.state = AppState::Loading {
-                        status: "获取二维码...".into(),
-                    };
-                    cx.notify();
-                })
-                .ok();
-
-                log_info!("[login] 获取二维码...");
                 login.fetch_qr_code().await?;
                 login.download_qr_image().await?;
-                log_success!("[login] 二维码已获取");
-
-                let qr_path = std::path::Path::new(QR_IMAGE_PATH);
-                login.save_qr_image(qr_path)?;
-                log_info!("[login] 二维码已保存: {}", qr_path.display());
-
-                this.update(&mut cx, |v, cx| {
-                    v.state = AppState::WaitingScan {
-                        status: "📱 请用微博手机客户端扫描二维码".into(),
-                        qr_path: Some(qr_path.to_path_buf()),
-                    };
-                    cx.notify();
-                })
-                .ok();
-
-                // --- Step 3: Poll scan status ---
-                let final_cookie = loop {
-                    match login.poll_status().await {
-                        Ok(QrStatus::Waiting) => {
-                            this.update(&mut cx, |v, cx| {
-                                if let AppState::WaitingScan { ref mut status, .. } =
-                                    v.state
-                                {
-                                    *status = "📱 等待扫码...".into();
-                                }
-                                cx.notify();
-                            })
-                            .ok();
-                            tokio::time::sleep(Duration::from_secs(2)).await;
-                        }
-                        Ok(QrStatus::Scanned) => {
-                            this.update(&mut cx, |v, cx| {
-                                v.state = AppState::WaitingScan {
-                                    status: "📲 已扫描！请在手机上点击「确认登录」".into(),
-                                    qr_path: Some(qr_path.to_path_buf()),
-                                };
-                                cx.notify();
-                            })
-                            .ok();
-                            tokio::time::sleep(Duration::from_secs(2)).await;
-                        }
-                        Ok(QrStatus::Confirmed { alt, redirect_url }) => {
-                            this.update(&mut cx, |v, cx| {
-                                v.state = AppState::Exchanging {
-                                    status: "✅ 确认成功！正在获取登录票据...".into(),
-                                };
-                                cx.notify();
-                            })
-                            .ok();
-
-                            login.exchange_ticket_with_url(&alt, &redirect_url).await?;
-
-                            let verified = login.verify_login().await.unwrap_or(false);
-                            if !verified {
-                                this.update(&mut cx, |v, cx| {
-                                    v.state = AppState::Error {
-                                        message: "登录验证失败，请重试".into(),
-                                    };
-                                    cx.notify();
-                                })
-                                .ok();
-                                return Ok(());
-                            }
-
-                            // --- Save cookies persistently ---
-                            if let Err(e) = login
-                                .save_cookies_to_file(std::path::Path::new(COOKIE_FILE))
-                            {
-                                log_error!("[login] 保存 Cookie 失败: {}", e);
-                            } else {
-                                log_success!("[login] Cookie 已保存到 {}", COOKIE_FILE);
-                            }
-
-                            let cookie_header = login.get_cookie_header();
-                            break cookie_header;
-                        }
-                        Ok(QrStatus::Expired) => {
-                            this.update(&mut cx, |v, cx| {
-                                v.state = AppState::Loading {
-                                    status: "⚠️ 二维码过期，重新获取...".into(),
-                                };
-                                cx.notify();
-                            })
-                            .ok();
-                            login.fetch_qr_code().await?;
-                            login.download_qr_image().await?;
-                            login.save_qr_image(qr_path)?;
-                            this.update(&mut cx, |v, cx| {
-                                v.state = AppState::WaitingScan {
-                                    status: "📱 请用微博手机客户端扫描二维码".into(),
-                                    qr_path: Some(qr_path.to_path_buf()),
-                                };
-                                cx.notify();
-                            })
-                            .ok();
-                        }
-                        Ok(QrStatus::Unknown { code, msg, .. }) => {
-                            log_info!("QR poll unknown: {} {}", code, msg);
-                            tokio::time::sleep(Duration::from_secs(2)).await;
-                        }
-                        Err(e) => {
-                            log_error!("QR poll error: {}", e);
-                            tokio::time::sleep(Duration::from_secs(2)).await;
-                        }
-                    }
-                };
-
-                // --- Step 4: Fetch home timeline ---
-                this.update(&mut cx, |v, cx| {
-                    v.state = AppState::FetchingHome;
-                    cx.notify();
-                })
-                .ok();
-
-                Self::fetch_timeline_with_cookie(
-                    &this,
-                    &mut cx,
-                    login.client(),
-                    &final_cookie,
-                )
-                .await?;
-
-                // Clean up QR image
-                let _ = std::fs::remove_file(qr_path);
-                Ok(())
+                let bytes = login.qr_image_bytes()
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("二维码数据为空"))?;
+                Ok((login, bytes))
             });
 
-            if let Err(e) = result {
-                log_error!(
-                    "[login] 登录流程失败: {:#} — 请检查网络连接后重试",
-                    e
-                );
-                this.update(&mut cx, |v, cx| {
-                    v.state = AppState::Error {
-                        message: format!(
-                            "{}\n\n详细错误已输出到终端 (stderr)",
-                            e
-                        ),
+            match init_result {
+                Ok((mut login, png_bytes)) => {
+                    log_info!("[login] QR ready: {} bytes", png_bytes.len());
+                    let _ = std::fs::write(std::path::Path::new(QR_IMAGE_PATH), &png_bytes);
+                    this.update(&mut cx, |v, cx| {
+                        v.state = AppState::WaitingScan {
+                            status: "📱 请用微博手机客户端扫描二维码".into(),
+                            qr_png_bytes: Some(png_bytes),
+                        };
+                        cx.notify();
+                    }).ok();
+                    log_info!("[login] WaitingScan 已设置, 等待渲染...");
+                    // yield so GPUI renders the QR code
+                    Timer::after(Duration::from_millis(100)).await;
+                    log_info!("[login] yield 完成, 开始轮询...");
+
+                    // --- Phase 2: polling loop ---
+                    let final_cookie = loop {
+                        let poll_result = tokio_handle.block_on(login.poll_status());
+                        match poll_result {
+                            Ok(QrStatus::Waiting) => {
+                                this.update(&mut cx, |v, cx| {
+                                    if let AppState::WaitingScan { ref mut status, .. } = v.state {
+                                        *status = "📱 等待扫码...".into();
+                                    }
+                                    cx.notify();
+                                }).ok();
+                            }
+                            Ok(QrStatus::Scanned) => {
+                                this.update(&mut cx, |v, cx| {
+                                    let qr_bytes = match &v.state {
+                                        AppState::WaitingScan { qr_png_bytes, .. } => qr_png_bytes.clone(),
+                                        _ => None,
+                                    };
+                                    v.state = AppState::WaitingScan {
+                                        status: "📲 已扫描！请在手机上点击「确认登录」".into(),
+                                        qr_png_bytes: qr_bytes,
+                                    };
+                                    cx.notify();
+                                }).ok();
+                            }
+                            Ok(QrStatus::Confirmed { alt, redirect_url }) => {
+                                this.update(&mut cx, |v, cx| {
+                                    v.state = AppState::Exchanging {
+                                        status: "✅ 确认成功！正在获取登录票据...".into(),
+                                    };
+                                    cx.notify();
+                                }).ok();
+
+                                let exchange_result: Result<String, anyhow::Error> = tokio_handle.block_on(async {
+                                    login.exchange_ticket_with_url(&alt, &redirect_url).await?;
+                                    let verified = login.verify_login().await.unwrap_or(false);
+                                    if !verified {
+                                        return Err(anyhow::anyhow!("登录验证失败"));
+                                    }
+                                    let _ = login.save_cookies_to_file(std::path::Path::new(COOKIE_FILE));
+                                    log_success!("[login] Cookie 已保存");
+                                    Ok(login.get_cookie_header())
+                                });
+
+                                match exchange_result {
+                                    Ok(cookie) => {
+                                        break cookie;
+                                    }
+                                    Err(e) => {
+                                        log_error!("[login] 票据交换失败: {}", e);
+                                        this.update(&mut cx, |v, cx| {
+                                            v.state = AppState::Error {
+                                                message: format!("登录失败: {}", e),
+                                            };
+                                            cx.notify();
+                                        }).ok();
+                                        return;
+                                    }
+                                }
+                            }
+                            Ok(QrStatus::Expired) => {
+                                log_info!("[login] QR 过期, 刷新...");
+                                this.update(&mut cx, |v, cx| {
+                                    v.state = AppState::Loading {
+                                        status: "⚠️ 二维码过期，重新获取...".into(),
+                                    };
+                                    cx.notify();
+                                }).ok();
+
+                                let refresh = tokio_handle.block_on(async {
+                                    login.fetch_qr_code().await?;
+                                    login.download_qr_image().await?;
+                                    login.qr_image_bytes().cloned()
+                                        .ok_or_else(|| anyhow::anyhow!("QR 刷新失败"))
+                                });
+                                match refresh {
+                                    Ok(png) => {
+                                        let _ = std::fs::write(std::path::Path::new(QR_IMAGE_PATH), &png);
+                                        this.update(&mut cx, |v, cx| {
+                                            v.state = AppState::WaitingScan {
+                                                status: "📱 请用微博手机客户端扫描二维码".into(),
+                                                qr_png_bytes: Some(png),
+                                            };
+                                            cx.notify();
+                                        }).ok();
+                                    }
+                                    Err(e) => {
+                                        log_error!("[login] QR 刷新失败: {}", e);
+                                    }
+                                }
+                            }
+                            Ok(QrStatus::Unknown { code, msg, .. }) => {
+                                log_info!("QR poll unknown: {} {}", code, msg);
+                            }
+                            Err(e) => {
+                                log_error!("QR poll error: {}", e);
+                            }
+                        }
+                        // Yield between polls so GPUI can render
+                        Timer::after(Duration::from_secs(1)).await;
                     };
-                    cx.notify();
-                })
-                .ok();
+
+                    // --- Phase 3: fetch home ---
+                    this.update(&mut cx, |v, cx| {
+                        v.state = AppState::FetchingHome;
+                        cx.notify();
+                    }).ok();
+
+                    let fetch_result: Result<(), anyhow::Error> = tokio_handle.block_on(
+                        Self::fetch_timeline_with_cookie(&this, &mut cx, login.client(), &final_cookie)
+                    );
+
+                    if let Err(e) = fetch_result {
+                        log_error!("[login] 首页加载失败: {}", e);
+                        this.update(&mut cx, |v, cx| {
+                            v.state = AppState::Error {
+                                message: format!("首页加载失败: {}", e),
+                            };
+                            cx.notify();
+                        }).ok();
+                    }
+                    let _ = std::fs::remove_file(QR_IMAGE_PATH);
+                }
+                Err(e) => {
+                    log_error!("[login] 初始化失败: {}", e);
+                    this.update(&mut cx, |v, cx| {
+                        v.state = AppState::Error {
+                            message: format!("连接失败: {}", e),
+                        };
+                        cx.notify();
+                    }).ok();
+                }
             }
             }
         })
@@ -602,7 +596,9 @@ impl Render for AppRoot {
 
 impl AppRoot {
     /// App header bar
-    fn render_header(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_logged_in = matches!(self.state, AppState::HomeLoaded { .. });
+
         div()
             .flex()
             .flex_row()
@@ -633,6 +629,37 @@ impl AppRoot {
                             .child("PC 客户端"),
                     ),
             )
+            .when(is_logged_in, |this| {
+                this.child(
+                    div()
+                        .id("logout-btn")
+                        .px_3()
+                        .py_1()
+                        .rounded_full()
+                        .bg(rgb(0x333355))
+                        .cursor_pointer()
+                        .text_size(px(13.0))
+                        .text_color(rgb(TEXT_SECONDARY))
+                        .child("登出")
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            log_info!("用户点击登出");
+                            this.logout(cx);
+                        })),
+                )
+            })
+    }
+
+    /// Logout: clear cookies, reset to QR login
+    fn logout(&mut self, cx: &mut Context<Self>) {
+        // Delete saved cookies
+        let _ = std::fs::remove_file(COOKIE_FILE);
+        log_info!("已删除 Cookie 文件 {}", COOKIE_FILE);
+        // Reset state and start login flow
+        self.state = AppState::Loading {
+            status: "正在登出...".into(),
+        };
+        cx.notify();
+        self.start_login_flow(cx);
     }
 
     /// Main content area — switches on state
@@ -644,8 +671,8 @@ impl AppRoot {
             AppState::Loading { status } => {
                 Self::render_centered(status, true).into_any_element()
             }
-            AppState::WaitingScan { status, qr_path } => {
-                Self::render_qr_screen(status, qr_path)
+            AppState::WaitingScan { status, qr_png_bytes } => {
+                Self::render_qr_screen(status, qr_png_bytes)
             }
             AppState::Exchanging { status } => {
                 Self::render_centered(status, true).into_any_element()
@@ -687,7 +714,7 @@ impl AppRoot {
     }
 
     /// QR code screen: image + status + hint
-    fn render_qr_screen(status: &str, qr_path: &Option<PathBuf>) -> AnyElement {
+    fn render_qr_screen(status: &str, qr_png_bytes: &Option<Vec<u8>>) -> AnyElement {
         let status = status.to_string();
         div()
             .flex()
@@ -708,13 +735,14 @@ impl AppRoot {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(if let Some(ref path) = qr_path {
+                    .child(if let Some(ref png_bytes) = qr_png_bytes {
+                        let image = gpui::Image::from_bytes(gpui::ImageFormat::Png, png_bytes.clone());
                         div()
                             .w(px(200.0))
                             .h(px(200.0))
                             .bg(rgb(0xffffff))
                             .child(
-                                img(path.clone())
+                                img(gpui::ImageSource::Image(std::sync::Arc::new(image)))
                                     .object_fit(ObjectFit::Contain),
                             )
                             .into_any_element()

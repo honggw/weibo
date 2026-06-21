@@ -8,7 +8,6 @@ use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
 use base64::Engine as _;
 use rand::Rng;
 use rsa::{
-    traits::PublicKeyParts,
     BigUint, Oaep, RsaPublicKey,
 };
 use sha2::Sha256;

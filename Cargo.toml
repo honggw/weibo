@@ -16,7 +16,7 @@ hex = "0.4"
 url = "2"
 open = "5"
 
-# WebView login (wry + tao)
+# WebView login (wry + tao) — kept for compatibility
 wry = "0.50"
 tao = "0.32"
 
@@ -24,6 +24,12 @@ tao = "0.32"
 aes = "0.8"
 cbc = "0.1"
 sha2 = "0.10"
+
+# Image decoding (QR code PNG → RGBA for GPUI)
+image = "0.25"
+
+# GPUI — GPU-accelerated UI framework
+gpui = "0.2"
 
 # MITM proxy
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }

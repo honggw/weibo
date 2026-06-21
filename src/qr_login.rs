@@ -97,6 +97,9 @@ impl QrLogin {
 
     pub fn set_rid(&mut self, rid: String) { self.rid = Some(rid); }
     pub fn client(&self) -> &reqwest::Client { &self.client }
+    pub fn qr_image_bytes(&self) -> Option<&Vec<u8>> { self.image_bytes.as_ref() }
+    pub fn qrid(&self) -> Option<&str> { self.qrid.as_deref() }
+    pub fn get_cookie_header(&self) -> String { self.cookie_header() }
 
     pub async fn poll_status(&self) -> Result<QrStatus> {
         let qrid = self.qrid.as_ref().context("先调 fetch_qr_code")?;

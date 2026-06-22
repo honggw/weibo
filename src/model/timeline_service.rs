@@ -1,6 +1,13 @@
-//! Timeline service — fetch following list, aggregate posts, fallback to hotsearch.
+//! Timeline service — fetch home timeline via allGroups + parallel mymblog.
+//!
+//! Strategy:
+//!   1. allGroups → get list_id + group info
+//!   2. friendships/friends → get followed user UIDs
+//!   3. Parallel mymblog per user → aggregate into timeline
+//!   4. Fallback: hotSearch (public API)
 
 use anyhow::Result;
+use futures::stream::{self, StreamExt};
 
 use crate::domain::TimelineItem;
 use crate::infra::config;
@@ -29,22 +36,29 @@ pub async fn fetch_following_ids(cookie: &str) -> Result<Vec<u64>> {
     Ok(uids)
 }
 
-/// Fetch recent posts from followed users and combine into a timeline.
-pub async fn fetch_from_friends(cookie: &str, uids: &[u64]) -> Vec<TimelineItem> {
-    let mut all_items: Vec<TimelineItem> = Vec::new();
-
-    for &uid in uids.iter().take(config::MAX_FOLLOWED_USERS) {
-        match http_client::auth_get(
-            &format!(
-                "{}?uid={}&page=1&feature=0",
-                config::API_MYMBLOG,
-                uid
-            ),
-            cookie,
-        )
+/// Fetch recent posts from ONE followed user.
+async fn fetch_user_posts(
+    client: &reqwest::Client,
+    cookie: &str,
+    uid: u64,
+) -> Vec<TimelineItem> {
+    let mut items = Vec::new();
+    match client
+        .get(format!(
+            "{}?uid={}&page=1&feature=0",
+            config::API_MYMBLOG,
+            uid
+        ))
+        .header("Cookie", cookie)
+        .header("Referer", config::WEIBO_BASE_URL)
+        .header("User-Agent", "Mozilla/5.0")
+        .header("X-Requested-With", "XMLHttpRequest")
+        .timeout(config::REQUEST_TIMEOUT)
+        .send()
         .await
-        {
-            Ok(data) => {
+    {
+        Ok(resp) => {
+            if let Ok(data) = resp.json::<serde_json::Value>().await {
                 if let Some(list) = data
                     .get("data")
                     .and_then(|d| d.get("list"))
@@ -64,19 +78,41 @@ pub async fn fetch_from_friends(cookie: &str, uids: &[u64]) -> Vec<TimelineItem>
                             .unwrap_or("")
                             .to_string();
                         if !text.is_empty() {
-                            all_items.push(TimelineItem { user_name, text });
+                            items.push(TimelineItem { user_name, text });
                         }
                     }
                 }
             }
-            Err(e) => log_info!("拉取用户 {} 微博失败: {}", uid, e),
         }
+        Err(e) => log_info!("拉取用户 {} 微博失败: {}", uid, e),
     }
-
-    all_items
+    items
 }
 
-/// Fetch hotsearch trends (public API, no auth needed).
+/// Fetch posts from followed users IN PARALLEL (using futures concurrency).
+pub async fn fetch_from_friends_parallel(
+    cookie: &str,
+    uids: &[u64],
+) -> Vec<TimelineItem> {
+    let client = http_client::build_no_store();
+    let cookie = cookie.to_string();
+
+    let futures: Vec<_> = uids
+        .iter()
+        .take(config::MAX_FOLLOWED_USERS)
+        .map(|&uid| fetch_user_posts(&client, &cookie, uid))
+        .collect();
+
+    // Execute up to 5 requests concurrently to avoid overwhelming the server
+    let results: Vec<Vec<TimelineItem>> = stream::iter(futures)
+        .buffer_unordered(5)
+        .collect()
+        .await;
+
+    results.into_iter().flatten().collect()
+}
+
+/// Fetch hotsearch trends (public API).
 pub async fn fetch_hotsearch() -> Result<Vec<TimelineItem>> {
     log_info!("请求热搜榜 API...");
     let data = http_client::public_get(config::API_HOTSEARCH).await?;
@@ -113,7 +149,10 @@ pub async fn fetch_hotsearch() -> Result<Vec<TimelineItem>> {
                         String::new()
                     };
 
-                    TimelineItem { user_name: word, text }
+                    TimelineItem {
+                        user_name: word,
+                        text,
+                    }
                 })
                 .collect()
         })
@@ -123,15 +162,18 @@ pub async fn fetch_hotsearch() -> Result<Vec<TimelineItem>> {
     Ok(items)
 }
 
-/// Main entry: fetch home content (timeline preferred, hotsearch fallback).
+/// Main entry: fetch home content (timeline from friends, fallback to hotsearch).
 /// Returns (items, title).
 pub async fn fetch_home_content(cookie: &str) -> (Vec<TimelineItem>, String) {
-    // Try following-based timeline first
+    // Try following-based timeline first (parallelized)
     log_info!("获取关注列表...");
     match fetch_following_ids(cookie).await {
         Ok(uids) if !uids.is_empty() => {
-            log_info!("获取到 {} 个关注用户, 拉取微博...", uids.len());
-            let items = fetch_from_friends(cookie, &uids).await;
+            log_info!(
+                "获取到 {} 个关注用户, 并行拉取微博...",
+                uids.len().min(config::MAX_FOLLOWED_USERS)
+            );
+            let items = fetch_from_friends_parallel(cookie, &uids).await;
             if !items.is_empty() {
                 let count = items.len();
                 let title = format!(

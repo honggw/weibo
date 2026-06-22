@@ -1,5 +1,6 @@
-//! View layer — pure GPUI rendering functions (stateless widgets).
-//! These functions read domain state and produce GPUI elements.
-//! They do NOT contain business logic or async operations.
+//! View layer — pure GPUI rendering, no business logic.
 
+pub mod app_shell;
+pub mod screens;
+pub mod theme;
 pub mod widgets;

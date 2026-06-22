@@ -2,12 +2,14 @@
 
 use gpui::*;
 
-use crate::domain::LoginPhase;
+use crate::domain::{ActiveTab, ChatMessage, LoginPhase};
 use crate::infra::cookie_io;
-use crate::model::{auth_service, timeline_service};
+use crate::infra::ws_client::WsMessage;
+use crate::model::{auth_service, chat_service, timeline_service};
 use crate::view::screens;
 use crate::log_info;
 
+use super::chat_vm::ChatData;
 use super::home_vm;
 use super::login_vm;
 
@@ -21,6 +23,20 @@ pub struct AppRoot {
     pub loading_more: bool,
     /// The list_id for friendstimeline (cached from allGroups)
     pub feed_list_id: Option<String>,
+    /// Currently active tab
+    pub active_tab: ActiveTab,
+    /// DM unread count
+    pub dm_unread: u64,
+    /// Whether DM fetch has been initiated
+    dm_fetched: bool,
+    /// Whether WebSocket has been started
+    ws_started: bool,
+    /// Chat data (lazy-loaded when chat tab is opened)
+    pub chat_data: Option<ChatData>,
+    /// List state for chat contact list
+    pub chat_list_state: ListState,
+    /// List state for chat messages
+    pub msg_list_state: ListState,
 }
 
 impl AppRoot {
@@ -32,6 +48,13 @@ impl AppRoot {
             since_id: String::new(),
             loading_more: false,
             feed_list_id: None,
+            active_tab: ActiveTab::Home,
+            dm_unread: 0,
+            dm_fetched: false,
+            ws_started: false,
+            chat_data: None,
+            chat_list_state: ListState::new(0, ListAlignment::Top, px(60.0)),
+            msg_list_state: ListState::new(0, ListAlignment::Top, px(50.0)),
         };
 
         if let Some(cookie) = auth_service::load_saved_cookie() {
@@ -45,12 +68,83 @@ impl AppRoot {
         this
     }
 
+    pub fn switch_tab(&mut self, cx: &mut Context<Self>, tab: ActiveTab) {
+        self.active_tab = tab;
+        if tab == ActiveTab::Chat {
+            crate::viewmodel::chat_vm::load_chat_data(cx, &self.tokio_handle);
+        }
+        cx.notify();
+    }
+
+    /// Handle an incoming WebSocket push message.
+    fn handle_ws_message(chat: &mut ChatData, msg: WsMessage) {
+        let channel = &msg.channel;
+        // Parse message data: expected fields from groupchat or DM push
+        let sender_id = msg.data.get("from_uid").or_else(|| msg.data.get("sender_id"))
+            .and_then(|v| v.as_u64()).map(|v| v.to_string()).unwrap_or_default();
+        let sender_name = msg.data.get("from_user").and_then(|u| u.get("screen_name"))
+            .or_else(|| msg.data.get("sender_screen_name"))
+            .and_then(|v| v.as_str()).unwrap_or("?").to_string();
+        let text = msg.data.get("content").or_else(|| msg.data.get("text"))
+            .and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let gid = msg.data.get("gid").and_then(|v| v.as_u64()).map(|v| v.to_string());
+        let msg_uid = gid.or_else(|| Some(sender_id.clone()));
+        let contact_uid = msg_uid.unwrap_or_default();
+
+        if text.is_empty() { return; }
+
+        let is_self = sender_id == chat.my_uid;
+        let new_msg = ChatMessage {
+            id: String::new(),
+            sender_id,
+            sender_name,
+            text: text.clone(),
+            created_at: String::new(),
+            is_self,
+        };
+
+        // If this contact is currently selected, append to message list
+        if chat.selected_uid.as_ref() == Some(&contact_uid) {
+            chat.messages.push(new_msg);
+            if let Some(ref lst) = chat.msg_list_state {
+                // Note: ListState doesn't have an easy way to increment, so we recreate
+                chat.msg_list_state = Some(ListState::new(chat.messages.len(), ListAlignment::Top, px(50.0)));
+            }
+            log_info!("[ws] 已追加消息到当前会话: {}", text.chars().take(20).collect::<String>());
+        }
+
+        // Update contact preview (last message) in the list
+        if let Some(contact) = chat.contacts.iter_mut().find(|c| c.user_id == contact_uid) {
+            contact.last_message = text.chars().take(50).collect();
+            if !is_self {
+                contact.unread_count += 1;
+            }
+        }
+
+        log_info!("[ws] 推送处理完成: channel={}, contact={}", channel, contact_uid);
+    }
+
     pub fn logout(&mut self, cx: &mut Context<Self>) {
         log_info!("用户点击登出");
         cookie_io::delete();
         self.phase = LoginPhase::Loading("正在登出...".into());
         cx.notify();
         login_vm::start_login_flow(cx, &self.tokio_handle);
+    }
+
+    /// Fetch DM unread count periodically
+    pub fn fetch_dm_count(cx: &mut Context<Self>, handle: &tokio::runtime::Handle) {
+        let handle = handle.clone();
+        cx.spawn(|this: WeakEntity<AppRoot>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                let count = handle.block_on(chat_service::fetch_dm_unread());
+                this.update(&mut cx, |v, cx| {
+                    v.dm_unread = count;
+                    cx.notify();
+                }).ok();
+            }
+        }).detach();
     }
 
     /// Trigger "load more" when scrolling near the bottom.
@@ -109,6 +203,44 @@ impl Render for AppRoot {
             ));
         }
 
-        screens::root_screen::render(&self.phase, &self.list_state, cx)
+        // One-time init when logged in
+        if matches!(self.phase, LoginPhase::HomeLoaded { .. }) {
+            if !self.dm_fetched {
+                self.dm_fetched = true;
+                Self::fetch_dm_count(cx, &self.tokio_handle);
+            }
+            if !self.ws_started {
+                self.ws_started = true;
+                let uid = self.chat_data.as_ref().and_then(|c| if c.my_uid.is_empty() { None } else { Some(c.my_uid.clone()) }).unwrap_or_else(|| "1744323680".to_string());
+                log_info!("[ws] 启动 WebSocket, uid={}", uid);
+                let mut rx = crate::model::chat_service::start_ws(uid, &self.tokio_handle);
+                // Spawn GPUI task to poll WS messages and update chat_data
+                cx.spawn(|this: WeakEntity<AppRoot>, cx: &mut AsyncApp| {
+                    let mut cx = cx.clone();
+                    async move {
+                        while let Some(msg) = rx.recv().await {
+                            if let Err(_) = this.update(&mut cx, |v, cx| {
+                                let chat = v.chat_data.get_or_insert_with(ChatData::new);
+                                Self::handle_ws_message(chat, msg);
+                                cx.notify();
+                            }) {
+                                break; // Entity released
+                            }
+                        }
+                    }
+                }).detach();
+            }
+        }
+
+        screens::root_screen::render(
+            &self.phase,
+            &self.active_tab,
+            self.dm_unread,
+            &self.list_state,
+            self.chat_data.as_ref(),
+            &self.chat_list_state,
+            &self.msg_list_state,
+            cx,
+        )
     }
 }

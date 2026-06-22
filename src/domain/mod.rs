@@ -4,6 +4,43 @@
 use std::fmt;
 
 // ============================================================================
+// Tabs
+// ============================================================================
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ActiveTab {
+    Home,
+    Chat,
+}
+
+// ============================================================================
+// Chat
+// ============================================================================
+
+/// A conversation contact in the DM list.
+#[derive(Clone, Debug)]
+pub struct Contact {
+    pub user_id: String,
+    pub screen_name: String,
+    pub avatar: String,
+    pub unread_count: u64,
+    pub last_message: String,
+    pub last_time: String,
+    pub is_group: bool,
+}
+
+/// A single chat message.
+#[derive(Clone, Debug)]
+pub struct ChatMessage {
+    pub id: String,
+    pub sender_id: String,
+    pub sender_name: String,
+    pub text: String,
+    pub created_at: String,
+    pub is_self: bool,
+}
+
+// ============================================================================
 // Timeline
 // ============================================================================
 

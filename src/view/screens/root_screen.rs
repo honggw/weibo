@@ -10,7 +10,7 @@ use crate::viewmodel::root_vm::AppRoot;
 use super::home_screen;
 use super::login_screen;
 
-pub fn render(phase: &LoginPhase, cx: &mut Context<AppRoot>) -> impl IntoElement {
+pub fn render(phase: &LoginPhase, list_state: &ListState, cx: &mut Context<AppRoot>) -> impl IntoElement {
     let is_logged_in = matches!(phase, LoginPhase::HomeLoaded { .. });
 
     div()
@@ -21,17 +21,17 @@ pub fn render(phase: &LoginPhase, cx: &mut Context<AppRoot>) -> impl IntoElement
         .child(header_bar::render(is_logged_in, cx.listener(
             |this, _: &ClickEvent, _window, cx| this.logout(cx),
         )))
-        .child(body(phase))
+        .child(body(phase, list_state))
 }
 
-fn body(phase: &LoginPhase) -> AnyElement {
+fn body(phase: &LoginPhase, list_state: &ListState) -> AnyElement {
     match phase {
         LoginPhase::CheckingCookie => login_screen::render_centered("正在检查登录状态...", true),
         LoginPhase::Loading(msg) => login_screen::render_centered(msg, true),
         LoginPhase::WaitingScan { status, qr_png_bytes } => login_screen::render_qr(status, qr_png_bytes),
         LoginPhase::Exchanging(msg) => login_screen::render_centered(msg, true),
         LoginPhase::FetchingHome => login_screen::render_centered("正在获取首页...", true),
-        LoginPhase::HomeLoaded { items, title } => home_screen::render(title, items),
+        LoginPhase::HomeLoaded { items, title } => home_screen::render(title, items, list_state),
         LoginPhase::Error(msg) => login_screen::render_error(msg),
     }
 }

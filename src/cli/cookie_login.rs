@@ -59,7 +59,7 @@ pub async fn run() -> Result<()> {
 
     if ok {
         println!("[OK] 登录成功!");
-        let (items, title) = timeline_service::fetch_home_content(&cookie_header).await;
+        let (items, title, _, _) = timeline_service::fetch_first_page().await;
         println!();
         println!("{}", "=".repeat(50));
         println!("  {}", title);

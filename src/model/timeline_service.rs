@@ -13,9 +13,18 @@ use crate::infra::http_client;
 use crate::infra::cookie_io;
 use crate::{log_error, log_info, log_success};
 
-/// Parse timeline items from friendstimeline response JSON.
-fn parse_statuses(data: &serde_json::Value) -> Vec<TimelineItem> {
-    data
+/// Parsed timeline result: items + pagination info.
+pub struct TimelineResult {
+    pub items: Vec<TimelineItem>,
+    /// Last status ID for "load more"
+    pub since_id: String,
+    /// The feed list_id (for subsequent pagination calls)
+    pub feed_list_id: String,
+}
+
+/// Parse timeline items + extract since_id from last status.
+fn parse_statuses(data: &serde_json::Value) -> TimelineResult {
+    let items: Vec<TimelineItem> = data
         .get("statuses")
         .and_then(|s| s.as_array())
         .map(|arr| {
@@ -37,7 +46,19 @@ fn parse_statuses(data: &serde_json::Value) -> Vec<TimelineItem> {
                 })
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    // Extract last status ID for pagination
+    let since_id = data
+        .get("statuses")
+        .and_then(|s| s.as_array())
+        .and_then(|arr| arr.last())
+        .and_then(|s| s.get("id").or_else(|| s.get("idstr")))
+        .and_then(|v| v.as_u64())
+        .map(|id| id.to_string())
+        .unwrap_or_default();
+
+    TimelineResult { items, since_id, feed_list_id: String::new() }
 }
 
 /// Get the "全部关注" list_id from allGroups API.
@@ -78,24 +99,36 @@ async fn get_following_list_id(client: &reqwest::Client, cookie_header: &str, xs
 }
 
 /// Fetch home timeline via friendstimeline API.
-pub async fn fetch_timeline(cookie_header: &str, xsrf: &str) -> Result<Vec<TimelineItem>> {
+/// `since_id` enables pagination (empty string for first page).
+pub async fn fetch_timeline(
+    cookie_header: &str,
+    xsrf: &str,
+    feed_list_id: &Option<String>,
+    since_id: &str,
+) -> Result<TimelineResult> {
     let client = http_client::build_no_store();
 
-    // Step 1: Get list_id
-    let list_id = match get_following_list_id(&client, cookie_header, xsrf).await {
-        Some(id) => id,
-        None => {
-            log_info!("无法获取 list_id, 回退到热搜榜");
-            return fetch_hotsearch().await;
+    // Step 1: Get list_id (only on first page)
+    let list_id = if let Some(ref id) = feed_list_id {
+        id.clone()
+    } else {
+        match get_following_list_id(&client, cookie_header, xsrf).await {
+            Some(id) => id,
+            None => {
+                log_info!("无法获取 list_id");
+                return Err(anyhow::anyhow!("无法获取 list_id"));
+            }
         }
     };
 
     // Step 2: Fetch timeline
-    log_info!("请求 friendstimeline (list_id={})...", &list_id[..list_id.len().min(20)]);
+    let since = if since_id.is_empty() { "0" } else { since_id };
+    log_info!("请求 friendstimeline (list_id={}, since_id={})...",
+        &list_id[..list_id.len().min(20)], since);
     let resp = client
         .get(format!(
-            "https://weibo.com/ajax/feed/friendstimeline?list_id={}&refresh=0&since_id=0&count=25&fid={}",
-            list_id, list_id
+            "https://weibo.com/ajax/feed/friendstimeline?list_id={}&refresh=0&since_id={}&count=25&fid={}",
+            list_id, since, list_id
         ))
         .header("Cookie", cookie_header)
         .header("Referer", config::WEIBO_BASE_URL)
@@ -112,12 +145,13 @@ pub async fn fetch_timeline(cookie_header: &str, xsrf: &str) -> Result<Vec<Timel
 
     if ok != 1 {
         log_error!("friendstimeline 返回 ok={}", ok);
-        return fetch_hotsearch().await;
+        return Err(anyhow::anyhow!("friendstimeline ok={}", ok));
     }
 
-    let items = parse_statuses(&data);
-    log_success!("friendstimeline 加载完成: {} 条微博", items.len());
-    Ok(items)
+    let mut result = parse_statuses(&data);
+    result.feed_list_id = list_id;
+    log_success!("friendstimeline: {} 条, since_id={}", result.items.len(), result.since_id);
+    Ok(result)
 }
 
 /// Fetch hotsearch trends (public API, fallback).
@@ -167,43 +201,55 @@ fn get_xsrf_token() -> Option<String> {
     cookie_io::load_xsrf()
 }
 
-/// Main entry: fetch home content.
-/// Returns (items, title).
-pub async fn fetch_home_content(_cookie: &str) -> (Vec<TimelineItem>, String) {
+/// Main entry: fetch first page of home content.
+pub async fn fetch_first_page() -> (Vec<TimelineItem>, String, Option<String>, String) {
     let cookie_header = build_full_cookie_header();
     let xsrf = get_xsrf_token().unwrap_or_default();
 
     log_info!("加载首页时间线 (friendstimeline)...");
-    match fetch_timeline(&cookie_header, &xsrf).await {
-        Ok(items) if !items.is_empty() => {
-            let title = format!("📰 首页时间线 ({}条)", items.len());
-            (items, title)
+    match fetch_timeline(&cookie_header, &xsrf, &None, "").await {
+        Ok(result) if !result.items.is_empty() => {
+            let title = format!("📰 首页时间线 ({}条)", result.items.len());
+            let feed_list_id = result.feed_list_id.clone();
+            (result.items, title, Some(feed_list_id), result.since_id)
         }
-        Ok(_) => {
-            log_info!("friendstimeline 返回空, 回退热搜榜");
-            match fetch_hotsearch().await {
-                Ok(items) => {
-                    let title = format!("🔥 热搜榜 ({}条)", items.len());
-                    (items, title)
-                }
-                Err(e) => {
-                    log_error!("热搜榜加载失败: {}", e);
-                    (vec![], "加载失败".into())
-                }
-            }
-        }
+        Ok(_) => fallback_hotsearch().await,
         Err(e) => {
             log_error!("friendstimeline 失败: {}, 回退热搜榜", e);
-            match fetch_hotsearch().await {
-                Ok(items) => {
-                    let title = format!("🔥 热搜榜 ({}条)", items.len());
-                    (items, title)
-                }
-                Err(e) => {
-                    log_error!("热搜榜加载失败: {}", e);
-                    (vec![], "加载失败".into())
-                }
-            }
+            fallback_hotsearch().await
+        }
+    }
+}
+
+/// Load more items (pagination).
+pub async fn load_more(
+    since_id: &str,
+    feed_list_id: &Option<String>,
+) -> (Vec<TimelineItem>, String) {
+    let cookie_header = build_full_cookie_header();
+    let xsrf = get_xsrf_token().unwrap_or_default();
+
+    match fetch_timeline(&cookie_header, &xsrf, feed_list_id, since_id).await {
+        Ok(result) => {
+            log_info!("加载更多: {} 条, new_since_id={}", result.items.len(), result.since_id);
+            (result.items, result.since_id)
+        }
+        Err(e) => {
+            log_error!("加载更多失败: {}", e);
+            (vec![], since_id.to_string())
+        }
+    }
+}
+
+async fn fallback_hotsearch() -> (Vec<TimelineItem>, String, Option<String>, String) {
+    match fetch_hotsearch().await {
+        Ok(items) => {
+            let title = format!("🔥 热搜榜 ({}条)", items.len());
+            (items, title, None, String::new())
+        }
+        Err(e) => {
+            log_error!("热搜榜加载失败: {}", e);
+            (vec![], "加载失败".into(), None, String::new())
         }
     }
 }

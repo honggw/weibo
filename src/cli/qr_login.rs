@@ -99,7 +99,7 @@ pub async fn run() -> Result<()> {
     };
 
     // --- Show home ---
-    let (items, title) = timeline_service::fetch_home_content(&cookie).await;
+    let (items, title, _, _) = timeline_service::fetch_first_page().await;
     println!();
     println!("{}", "=".repeat(50));
     println!("  {}", title);

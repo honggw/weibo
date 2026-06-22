@@ -41,10 +41,13 @@ pub fn start_cookie_flow(
             }).ok();
             Timer::after(Duration::from_millis(100)).await;
 
-            let (items, title) = handle.block_on(timeline_service::fetch_home_content(&cookie));
-            log_info!("[cookie] fetch_home_content 完成: {} items", items.len());
+            let (items, title, feed_list_id, since_id) = handle.block_on(timeline_service::fetch_first_page());
+            log_info!("[cookie] 首页加载完成: {} items, list_id={:?}", items.len(), feed_list_id);
 
             match this.update(&mut cx, |v, cx| {
+                v.list_state = ListState::new(items.len(), ListAlignment::Top, px(200.0));
+                v.since_id = since_id;
+                v.feed_list_id = feed_list_id;
                 v.phase = LoginPhase::HomeLoaded { items, title };
                 cx.notify();
             }) {

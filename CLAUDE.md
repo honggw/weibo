@@ -12,3 +12,4 @@
 
 ## common instructions
 - 除非特别指定，否则默认使用rust语言
+- 尽量不使用unsafe语法，如果非用不可，请说明原因，并记录在unsafe.md文件中

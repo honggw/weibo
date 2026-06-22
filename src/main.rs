@@ -1,302 +1,46 @@
 //! 微博 (weibo.com) PC 客户端
 //!
-//! 基于 GPUI 的桌面客户端，支持:
-//!   1. QR 码扫码登录 (图形界面)
-//!   2. 登录后浏览首页时间线
+//! Architecture (MVVM):
+//!   gpui_views (ViewModel) → model (Services) → infra (HTTP, IO) → domain (Models)
+//!   view/widgets (View) reads domain state for pure GPUI rendering
 //!
-//! 用法:
+//! Usage:
 //!   cargo run                  → GPUI 图形界面 (默认)
-//!   cargo run -- http          → 纯 HTTP QR 登录 (终端)
-//!   cargo run -- cookie        → Cookie 登录模式 (终端)
+//!   cargo run -- http          → 终端 QR 登录
+//!   cargo run -- cookie        → 终端 Cookie 登录
 
-mod bot_detector;
+mod cli;
+mod domain;
 mod gpui_views;
+mod infra;
+mod legacy;
 #[macro_use]
 mod logger;
+mod model;
 mod qr_login;
+mod view;
 
-use anyhow::Result;
 use gpui::AppContext;
-use reqwest::header::{HeaderMap, HeaderValue, REFERER, USER_AGENT};
-use std::io::{self, Write};
-use std::time::Duration;
-
-const WEIBO_URL: &str = "https://weibo.com";
-const DEFAULT_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-                           (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
-
-// ============================================================================
-// 工具函数
-// ============================================================================
-
-fn api_headers(referer: &str) -> HeaderMap {
-    let mut h = HeaderMap::new();
-    h.insert(USER_AGENT, HeaderValue::from_static(DEFAULT_UA));
-    h.insert(REFERER, HeaderValue::from_str(referer).unwrap());
-    h.insert(
-        "Accept",
-        HeaderValue::from_static("application/json, text/plain, */*"),
-    );
-    h.insert(
-        "X-Requested-With",
-        HeaderValue::from_static("XMLHttpRequest"),
-    );
-    h
-}
-
-async fn show_hot_search(client: &reqwest::Client) {
-    match client
-        .get(format!("{}/ajax/side/hotSearch", WEIBO_URL))
-        .headers(api_headers(WEIBO_URL))
-        .send()
-        .await
-    {
-        Ok(resp) => {
-            if let Ok(data) = resp.json::<serde_json::Value>().await {
-                let empty = vec![];
-                let items = data
-                    .get("data")
-                    .and_then(|d| d.get("band_list"))
-                    .and_then(|b| b.as_array())
-                    .unwrap_or(&empty);
-                println!();
-                println!("{}", "=".repeat(50));
-                println!("  🔥 热搜榜");
-                println!("{}", "=".repeat(50));
-                for (i, item) in items.iter().take(15).enumerate() {
-                    let word = item.get("word").and_then(|v| v.as_str()).unwrap_or("?");
-                    let num = item.get("num").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let hot = item.get("category").and_then(|v| v.as_str()).unwrap_or("");
-                    if num > 0 {
-                        println!("  {:>2}. {}  (热度 {})", i + 1, word, num);
-                    } else if !hot.is_empty() {
-                        println!("  {:>2}. {}  [{}]", i + 1, word, hot);
-                    } else {
-                        println!("  {:>2}. {}", i + 1, word);
-                    }
-                }
-            }
-        }
-        Err(e) => eprintln!("获取热搜失败: {}", e),
-    }
-}
-
-async fn show_home_timeline(client: &reqwest::Client) {
-    match client
-        .get(format!(
-            "{}/ajax/statuses/home_timeline?page=1&feature=0",
-            WEIBO_URL
-        ))
-        .headers(api_headers(WEIBO_URL))
-        .send()
-        .await
-    {
-        Ok(resp) => {
-            if let Ok(data) = resp.json::<serde_json::Value>().await {
-                let empty = vec![];
-                let statuses = data
-                    .get("data")
-                    .and_then(|d| d.get("statuses"))
-                    .and_then(|s| s.as_array())
-                    .unwrap_or(&empty);
-                println!();
-                println!("{}", "=".repeat(50));
-                println!("  📰 首页微博 ({})", statuses.len());
-                println!("{}", "=".repeat(50));
-                for (i, s) in statuses.iter().take(10).enumerate() {
-                    let user = s
-                        .get("user")
-                        .and_then(|u| u.get("screen_name"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("?");
-                    let text = s
-                        .get("text_raw")
-                        .or_else(|| s.get("text"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let short = if text.len() > 70 { &text[..70] } else { text };
-                    println!("  [{}/{}] {}: {}", i + 1, statuses.len(), user, short);
-                }
-            }
-        }
-        Err(e) => eprintln!("获取首页失败: {}", e),
-    }
-}
-
-// ============================================================================
-// QR 码扫码登录 (终端模式)
-// ============================================================================
-
-async fn qr_login_mode() -> Result<()> {
-    use qr_login::{QrLogin, QrStatus};
-
-    println!();
-    println!("{}", "=".repeat(50));
-    println!("  微博 QR 码扫码登录");
-    println!("{}", "=".repeat(50));
-    println!();
-    println!("  正在连接微博...");
-
-    let mut login = QrLogin::new()?;
-    login.warmup().await?;
-    login.fetch_qr_code().await?;
-    login.download_qr_image().await?;
-
-    let qr_path = std::path::Path::new("weibo_qr.png");
-    login.save_qr_image(qr_path)?;
-
-    println!("  ✅ 二维码已保存到: {}", qr_path.display());
-    println!("     图片查看器已打开（如未自动打开请手动双击）");
-    println!();
-    println!("  📱 请用微博手机客户端扫描二维码");
-    println!();
-    println!("  {} 等待扫码...", "⏳");
-
-    let start = std::time::Instant::now();
-    let timeout = Duration::from_secs(300);
-    let mut last_status = String::new();
-
-    loop {
-        if start.elapsed() > timeout {
-            println!();
-            println!("  ⏰ 超时：5 分钟内未完成扫码");
-            break;
-        }
-
-        match login.poll_status().await {
-            Ok(QrStatus::Waiting) => {
-                if last_status != "waiting" {
-                    print!(".");
-                    io::stdout().flush().ok();
-                }
-                last_status = "waiting".into();
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-            Ok(QrStatus::Scanned) => {
-                if last_status != "scanned" {
-                    println!();
-                    println!("  📲 已扫描！请在手机上点击「确认登录」");
-                }
-                last_status = "scanned".into();
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-            Ok(QrStatus::Confirmed { alt, redirect_url }) => {
-                println!();
-                println!("  ✅ 确认成功！正在获取登录票据...");
-                login.exchange_ticket_with_url(&alt, &redirect_url).await?;
-
-                match login.verify_login().await {
-                    Ok(true) => {
-                        println!("  🎉 登录成功！");
-                        login.save_cookies_to_file(std::path::Path::new("weibo_cookies.json"))?;
-                        println!("  💾 Cookies 已保存到 weibo_cookies.json");
-                        println!();
-
-                        show_hot_search(login.client()).await;
-                        show_home_timeline(login.client()).await;
-
-                        let _ = std::fs::remove_file(qr_path);
-                        return Ok(());
-                    }
-                    Ok(false) => {
-                        println!("  ❌ 登录验证失败，Cookie 可能无效");
-                    }
-                    Err(e) => {
-                        println!("  ❌ 验证登录时出错: {}", e);
-                    }
-                }
-                break;
-            }
-            Ok(QrStatus::Expired) => {
-                println!();
-                println!("  ⚠️ 二维码已过期，重新获取...");
-                login.fetch_qr_code().await?;
-                login.download_qr_image().await?;
-                login.save_qr_image(qr_path)?;
-                println!("  ✅ 新的二维码已生成");
-                last_status = String::new();
-            }
-            Ok(QrStatus::Unknown { code, msg, .. }) => {
-                eprintln!("  ⚠️ 未知状态: {} {} (继续等待...)", code, msg);
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-            Err(e) => {
-                eprintln!("  ❌ 轮询错误: {}", e);
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-// ============================================================================
-// Cookie 登录模式 (备用)
-// ============================================================================
-
-async fn cookie_login_mode() -> Result<()> {
-    println!("微博 Cookie 登录");
-    println!("{}", "=".repeat(50));
-    println!();
-    println!("请先在浏览器中登录 https://weibo.com/");
-    println!("然后获取 Cookie:");
-    println!("  F12 -> Application -> Cookies -> weibo.com -> 复制 SUB 的值");
-    println!();
-
-    print!("粘贴 Cookie (SUB值 或完整Cookie字符串): ");
-    io::stdout().flush().unwrap();
-    let mut cookie_input = String::new();
-    io::stdin().read_line(&mut cookie_input)?;
-    let cookie_input = cookie_input.trim();
-
-    if cookie_input.is_empty() {
-        println!("未输入 Cookie");
-        return Ok(());
-    }
-
-    let cookie_header = if cookie_input.contains('=') {
-        cookie_input.to_string()
-    } else {
-        format!("SUB={}", cookie_input)
-    };
-
-    let client = reqwest::Client::builder().cookie_store(true).build()?;
-    client
-        .get(WEIBO_URL)
-        .header("Cookie", &cookie_header)
-        .header(USER_AGENT, HeaderValue::from_static(DEFAULT_UA))
-        .send()
-        .await?;
-
-    let resp = client
-        .get(format!(
-            "{}/ajax/statuses/home_timeline?page=1&feature=0",
-            WEIBO_URL
-        ))
-        .headers(api_headers(WEIBO_URL))
-        .send()
-        .await?;
-    let data: serde_json::Value = resp.json().await?;
-    let ok = data.get("ok").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
-
-    if ok {
-        println!("[OK] 登录成功!");
-        show_hot_search(&client).await;
-        show_home_timeline(&client).await;
-    } else {
-        println!("[FAIL] 未登录，请检查 Cookie");
-    }
-
-    Ok(())
-}
 
 // ============================================================================
 // GPUI 图形界面入口
 // ============================================================================
 
 fn gpui_mode() {
-    // Create a tokio runtime for async HTTP requests.
-    // We leak it so it stays alive for the entire application lifetime.
+    // Install panic hook to capture crash info in log
+    std::panic::set_hook(Box::new(|info| {
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic".to_string()
+        };
+        let location = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_default();
+        log_error!("!!! PANIC at {}: {}", location, msg);
+        // Also write directly to stderr in case logger failed
+        eprintln!("!!! PANIC at {}: {}", location, msg);
+    }));
     let tokio_rt = Box::leak(Box::new(
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -305,7 +49,6 @@ fn gpui_mode() {
     ));
     let tokio_handle = tokio_rt.handle().clone();
 
-    println!("🚀 启动微博 PC 客户端 (GPUI)...");
     log_info!("========================================");
     log_info!("微博 PC 客户端启动 (GPUI mode)");
     log_info!("日志文件: weibo_app.log");
@@ -344,26 +87,21 @@ fn main() {
 
     match args.get(1).map(|s| s.as_str()) {
         Some("cookie") => {
-            // Terminal-based cookie login
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = cookie_login_mode().await {
+                if let Err(e) = cli::cookie_login::run().await {
                     eprintln!("错误: {}", e);
                 }
             });
         }
         Some("http") => {
-            // Terminal-based QR login
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = qr_login_mode().await {
+                if let Err(e) = cli::qr_login::run().await {
                     eprintln!("错误: {}", e);
                 }
             });
         }
-        _ => {
-            // Default: GPUI graphical UI
-            gpui_mode();
-        }
+        _ => gpui_mode(),
     }
 }

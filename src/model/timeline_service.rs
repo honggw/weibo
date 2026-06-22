@@ -1,118 +1,126 @@
-//! Timeline service — fetch home timeline via allGroups + parallel mymblog.
+//! Timeline service — fetch home timeline via allGroups → friendstimeline.
 //!
-//! Strategy:
-//!   1. allGroups → get list_id + group info
-//!   2. friendships/friends → get followed user UIDs
-//!   3. Parallel mymblog per user → aggregate into timeline
-//!   4. Fallback: hotSearch (public API)
+//! Data source (per weibo.com HAR analysis):
+//!   1. /ajax/feed/allGroups → get list_id for "全部关注" (gid prefix "10001")
+//!   2. /ajax/feed/friendstimeline?list_id={gid}&count=25 → timeline JSON
+//!   3. Fallback: hotSearch (public API)
 
 use anyhow::Result;
-use futures::stream::{self, StreamExt};
 
 use crate::domain::TimelineItem;
 use crate::infra::config;
 use crate::infra::http_client;
+use crate::infra::cookie_io;
 use crate::{log_error, log_info, log_success};
 
-/// Fetch the list of followed user UIDs.
-pub async fn fetch_following_ids(cookie: &str) -> Result<Vec<u64>> {
-    let data = http_client::auth_get(
-        &format!("{}?page=1", config::API_FRIENDSHIPS),
-        cookie,
-    )
-    .await?;
-
-    let uids: Vec<u64> = data
-        .get("users")
-        .and_then(|u| u.as_array())
+/// Parse timeline items from friendstimeline response JSON.
+fn parse_statuses(data: &serde_json::Value) -> Vec<TimelineItem> {
+    data
+        .get("statuses")
+        .and_then(|s| s.as_array())
         .map(|arr| {
             arr.iter()
-                .take(config::MAX_FOLLOWED_USERS)
-                .filter_map(|u| u.get("id").and_then(|v| v.as_u64()))
+                .map(|s| {
+                    let user_name = s
+                        .get("user")
+                        .and_then(|u| u.get("screen_name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                        .to_string();
+                    let text = s
+                        .get("text_raw")
+                        .or_else(|| s.get("text"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    TimelineItem { user_name, text }
+                })
                 .collect()
         })
-        .unwrap_or_default();
-
-    Ok(uids)
+        .unwrap_or_default()
 }
 
-/// Fetch recent posts from ONE followed user.
-async fn fetch_user_posts(
-    client: &reqwest::Client,
-    cookie: &str,
-    uid: u64,
-) -> Vec<TimelineItem> {
-    let mut items = Vec::new();
-    match client
-        .get(format!(
-            "{}?uid={}&page=1&feature=0",
-            config::API_MYMBLOG,
-            uid
-        ))
-        .header("Cookie", cookie)
+/// Get the "全部关注" list_id from allGroups API.
+async fn get_following_list_id(client: &reqwest::Client, cookie_header: &str, xsrf: &str) -> Option<String> {
+    let resp = client
+        .get("https://weibo.com/ajax/feed/allGroups")
+        .header("Cookie", cookie_header)
         .header("Referer", config::WEIBO_BASE_URL)
-        .header("User-Agent", "Mozilla/5.0")
+        .header("User-Agent", config::DEFAULT_UA)
         .header("X-Requested-With", "XMLHttpRequest")
+        .header("X-XSRF-TOKEN", xsrf)
+        .header("Accept", "application/json, text/plain, */*")
         .timeout(config::REQUEST_TIMEOUT)
         .send()
         .await
-    {
-        Ok(resp) => {
-            if let Ok(data) = resp.json::<serde_json::Value>().await {
-                if let Some(list) = data
-                    .get("data")
-                    .and_then(|d| d.get("list"))
-                    .and_then(|l| l.as_array())
-                {
-                    for s in list.iter().take(config::MAX_POSTS_PER_USER) {
-                        let user_name = s
-                            .get("user")
-                            .and_then(|u| u.get("screen_name"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("?")
-                            .to_string();
-                        let text = s
-                            .get("text_raw")
-                            .or_else(|| s.get("text"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        if !text.is_empty() {
-                            items.push(TimelineItem { user_name, text });
-                        }
+        .ok()?;
+
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let groups = data.get("groups")?.as_array()?;
+
+    for group in groups {
+        if let Some(sub_groups) = group.get("group").and_then(|g| g.as_array()) {
+            for g in sub_groups {
+                if let Some(gid) = g.get("gid").and_then(|v| v.as_str()) {
+                    // "全部关注" uses gid prefix "10001"
+                    if gid.starts_with("10001") {
+                        log_info!("找到关注分组: gid={}, title={}", gid,
+                            g.get("title").and_then(|v| v.as_str()).unwrap_or("?"));
+                        return Some(gid.to_string());
                     }
                 }
             }
         }
-        Err(e) => log_info!("拉取用户 {} 微博失败: {}", uid, e),
     }
-    items
+
+    log_info!("allGroups 中未找到 10001 前缀的分组");
+    None
 }
 
-/// Fetch posts from followed users IN PARALLEL (using futures concurrency).
-pub async fn fetch_from_friends_parallel(
-    cookie: &str,
-    uids: &[u64],
-) -> Vec<TimelineItem> {
+/// Fetch home timeline via friendstimeline API.
+pub async fn fetch_timeline(cookie_header: &str, xsrf: &str) -> Result<Vec<TimelineItem>> {
     let client = http_client::build_no_store();
-    let cookie = cookie.to_string();
 
-    let futures: Vec<_> = uids
-        .iter()
-        .take(config::MAX_FOLLOWED_USERS)
-        .map(|&uid| fetch_user_posts(&client, &cookie, uid))
-        .collect();
+    // Step 1: Get list_id
+    let list_id = match get_following_list_id(&client, cookie_header, xsrf).await {
+        Some(id) => id,
+        None => {
+            log_info!("无法获取 list_id, 回退到热搜榜");
+            return fetch_hotsearch().await;
+        }
+    };
 
-    // Execute up to 5 requests concurrently to avoid overwhelming the server
-    let results: Vec<Vec<TimelineItem>> = stream::iter(futures)
-        .buffer_unordered(5)
-        .collect()
-        .await;
+    // Step 2: Fetch timeline
+    log_info!("请求 friendstimeline (list_id={})...", &list_id[..list_id.len().min(20)]);
+    let resp = client
+        .get(format!(
+            "https://weibo.com/ajax/feed/friendstimeline?list_id={}&refresh=0&since_id=0&count=25&fid={}",
+            list_id, list_id
+        ))
+        .header("Cookie", cookie_header)
+        .header("Referer", config::WEIBO_BASE_URL)
+        .header("User-Agent", config::DEFAULT_UA)
+        .header("X-Requested-With", "XMLHttpRequest")
+        .header("X-XSRF-TOKEN", xsrf)
+        .header("Accept", "application/json, text/plain, */*")
+        .timeout(config::REQUEST_TIMEOUT)
+        .send()
+        .await?;
 
-    results.into_iter().flatten().collect()
+    let data: serde_json::Value = resp.json().await?;
+    let ok = data.get("ok").and_then(|v| v.as_i64()).unwrap_or(0);
+
+    if ok != 1 {
+        log_error!("friendstimeline 返回 ok={}", ok);
+        return fetch_hotsearch().await;
+    }
+
+    let items = parse_statuses(&data);
+    log_success!("friendstimeline 加载完成: {} 条微博", items.len());
+    Ok(items)
 }
 
-/// Fetch hotsearch trends (public API).
+/// Fetch hotsearch trends (public API, fallback).
 pub async fn fetch_hotsearch() -> Result<Vec<TimelineItem>> {
     log_info!("请求热搜榜 API...");
     let data = http_client::public_get(config::API_HOTSEARCH).await?;
@@ -127,18 +135,9 @@ pub async fn fetch_hotsearch() -> Result<Vec<TimelineItem>> {
             arr.iter()
                 .take(config::MAX_HOTSEARCH_ITEMS)
                 .map(|item| {
-                    let word = item
-                        .get("word")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("?")
-                        .to_string();
+                    let word = item.get("word").and_then(|v| v.as_str()).unwrap_or("?").to_string();
                     let num = item.get("num").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let note = item
-                        .get("note")
-                        .or_else(|| item.get("category"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-
+                    let note = item.get("note").or_else(|| item.get("category")).and_then(|v| v.as_str()).unwrap_or("");
                     let text = if num > 0 && !note.is_empty() {
                         format!("🔥 热度 {} — {}", num, note)
                     } else if num > 0 {
@@ -148,11 +147,7 @@ pub async fn fetch_hotsearch() -> Result<Vec<TimelineItem>> {
                     } else {
                         String::new()
                     };
-
-                    TimelineItem {
-                        user_name: word,
-                        text,
-                    }
+                    TimelineItem { user_name: word, text }
                 })
                 .collect()
         })
@@ -162,42 +157,53 @@ pub async fn fetch_hotsearch() -> Result<Vec<TimelineItem>> {
     Ok(items)
 }
 
-/// Main entry: fetch home content (timeline from friends, fallback to hotsearch).
-/// Returns (items, title).
-pub async fn fetch_home_content(cookie: &str) -> (Vec<TimelineItem>, String) {
-    // Try following-based timeline first (parallelized)
-    log_info!("获取关注列表...");
-    match fetch_following_ids(cookie).await {
-        Ok(uids) if !uids.is_empty() => {
-            log_info!(
-                "获取到 {} 个关注用户, 并行拉取微博...",
-                uids.len().min(config::MAX_FOLLOWED_USERS)
-            );
-            let items = fetch_from_friends_parallel(cookie, &uids).await;
-            if !items.is_empty() {
-                let count = items.len();
-                let title = format!(
-                    "📰 首页时间线 ({}位关注者, {}条)",
-                    uids.len().min(config::MAX_FOLLOWED_USERS),
-                    count
-                );
-                log_success!("首页时间线: {} 条", count);
-                return (items, title);
-            }
-        }
-        Ok(_) => log_info!("无关注用户，回退到热搜榜"),
-        Err(e) => log_info!("获取关注列表失败: {}, 回退到热搜榜", e),
-    }
+/// Build full cookie header from saved file (all cookies, not just SUB+SUBP).
+fn build_full_cookie_header() -> String {
+    cookie_io::load_full()
+}
 
-    // Fallback to hotsearch
-    match fetch_hotsearch().await {
-        Ok(items) => {
-            let title = format!("🔥 热搜榜 ({}条)", items.len());
+/// Extract XSRF token from saved cookies.
+fn get_xsrf_token() -> Option<String> {
+    cookie_io::load_xsrf()
+}
+
+/// Main entry: fetch home content.
+/// Returns (items, title).
+pub async fn fetch_home_content(_cookie: &str) -> (Vec<TimelineItem>, String) {
+    let cookie_header = build_full_cookie_header();
+    let xsrf = get_xsrf_token().unwrap_or_default();
+
+    log_info!("加载首页时间线 (friendstimeline)...");
+    match fetch_timeline(&cookie_header, &xsrf).await {
+        Ok(items) if !items.is_empty() => {
+            let title = format!("📰 首页时间线 ({}条)", items.len());
             (items, title)
         }
+        Ok(_) => {
+            log_info!("friendstimeline 返回空, 回退热搜榜");
+            match fetch_hotsearch().await {
+                Ok(items) => {
+                    let title = format!("🔥 热搜榜 ({}条)", items.len());
+                    (items, title)
+                }
+                Err(e) => {
+                    log_error!("热搜榜加载失败: {}", e);
+                    (vec![], "加载失败".into())
+                }
+            }
+        }
         Err(e) => {
-            log_error!("热搜榜加载失败: {}", e);
-            (vec![], "加载失败".into())
+            log_error!("friendstimeline 失败: {}, 回退热搜榜", e);
+            match fetch_hotsearch().await {
+                Ok(items) => {
+                    let title = format!("🔥 热搜榜 ({}条)", items.len());
+                    (items, title)
+                }
+                Err(e) => {
+                    log_error!("热搜榜加载失败: {}", e);
+                    (vec![], "加载失败".into())
+                }
+            }
         }
     }
 }

@@ -72,3 +72,51 @@ pub fn delete() {
 pub fn exists() -> bool {
     Path::new(config::COOKIE_FILE).exists()
 }
+
+/// Load ALL cookies from file as a full Cookie header string (for friendstimeline API).
+pub fn load_full() -> String {
+    let data = match std::fs::read_to_string(config::COOKIE_FILE) {
+        Ok(d) => d,
+        Err(_) => return String::new(),
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&data) {
+        Ok(p) => p,
+        Err(_) => return String::new(),
+    };
+
+    let parts: Vec<String> = parsed
+        .get("cookies")
+        .and_then(|c| c.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| {
+                    let name = c.get("name")?.as_str()?;
+                    let value = c.get("value")?.as_str()?;
+                    Some(format!("{}={}", name, value))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let header = parts.join("; ");
+    log_info!("构建完整 Cookie header: {} 个键", parts.len());
+    header
+}
+
+/// Extract XSRF-TOKEN value from saved cookies.
+pub fn load_xsrf() -> Option<String> {
+    let data = std::fs::read_to_string(config::COOKIE_FILE).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&data).ok()?;
+    parsed
+        .get("cookies")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| {
+            arr.iter().find_map(|c| {
+                if c.get("name")?.as_str()? == "XSRF-TOKEN" {
+                    c.get("value")?.as_str().map(String::from)
+                } else {
+                    None
+                }
+            })
+        })
+}

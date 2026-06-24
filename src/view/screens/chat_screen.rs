@@ -311,6 +311,35 @@ fn message_panel(
         // Message list
         .child(if !msgs.is_empty() {
             if let Some(lst) = msg_list_state {
+                // Set scroll handler to load more messages when scrolled to top
+                if show_more {
+                    let scroll_uid = uid.clone();
+                    let scroll_muid = my_uid.clone();
+                    let scroll_mid = oldest_mid.clone().unwrap_or_default();
+                    lst.set_scroll_handler(cx.listener(
+                        move |this, event: &ListScrollEvent, _window, cx| {
+                            if event.visible_range.start == 0 {
+                                // Prevent duplicate loads
+                                let already_loading = this.chat_data.as_ref()
+                                    .map(|c| c.messages_loading)
+                                    .unwrap_or(false);
+                                if !already_loading {
+                                    if let Some(chat) = this.chat_data.as_mut() {
+                                        chat.messages_loading = true;
+                                    }
+                                    chat_vm::load_more_messages(
+                                        cx,
+                                        &this.tokio_handle,
+                                        scroll_uid.clone(),
+                                        scroll_muid.clone(),
+                                        is_group,
+                                        scroll_mid.clone(),
+                                    );
+                                }
+                            }
+                        },
+                    ));
+                }
                 let items_for_list = list_items.clone();
                 list(lst, move |ix, _window, _cx| {
                     if ix >= items_for_list.len() {

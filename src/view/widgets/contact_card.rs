@@ -34,16 +34,26 @@ pub fn render(contact: &Contact) -> impl IntoElement {
                         .child(div().text_size(px(11.0)).text_color(rgb(theme::CLR_MUTED)).child(contact.last_time.clone())),
                 )
                 .child(
-                    div().flex().flex_row().justify_between()
+                    div().flex().flex_row().justify_between().items_center()
                         .child(
                             div().text_size(px(12.0)).text_color(rgb(theme::CLR_MUTED))
                                 .whitespace_nowrap().overflow_hidden().text_ellipsis()
                                 .child(contact.last_message.clone()),
                         )
                         .child(if contact.unread_count > 0 {
-                            div().px_2().py_0p5().rounded_full().bg(rgb(theme::CLR_ACCENT))
-                                .text_size(px(11.0)).text_color(rgb(0xffffff))
-                                .child(format!("{}", contact.unread_count))
+                            let label = if contact.unread_count > 99 {
+                                "99+".to_string()
+                            } else {
+                                format!("{}", contact.unread_count)
+                            };
+                            div()
+                                .min_w(px(18.0)).h(px(18.0))
+                                .flex().items_center().justify_center()
+                                .flex_shrink_0()
+                                .px_1().rounded_full()
+                                .bg(rgb(theme::CLR_ACCENT))
+                                .text_size(px(10.0)).text_color(rgb(0xffffff))
+                                .child(label)
                                 .into_any_element()
                         } else {
                             div().into_any_element()

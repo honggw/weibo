@@ -72,7 +72,7 @@ pub fn count_list_items(msgs: &[ChatMessage]) -> usize {
 /// 重建 msg_list_state, 使用包含 TimeSeparator 的真实项数。
 pub fn rebuild_msg_list_state(chat: &mut ChatData, alignment: ListAlignment) {
     let item_count = count_list_items(&chat.messages);
-    chat.msg_list_state = Some(ListState::new(item_count, alignment, px(50.0)));
+    chat.msg_list_state = Some(ListState::new(item_count, alignment, px(400.0)));
 }
 
 /// Spawn loading contacts list.
@@ -167,6 +167,7 @@ pub fn load_more_messages(cx: &mut Context<AppRoot>, handle: &tokio::runtime::Ha
 
             this.update(&mut cx, |v, cx| {
                 if let Some(chat) = v.chat_data.as_mut() {
+                    chat.messages_loading = false;
                     let count = older.len();
                     if count > 0 {
                         // Update oldest_mid for next pagination

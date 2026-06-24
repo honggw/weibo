@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod config;
 pub mod cookie_io;
 pub mod http_client;

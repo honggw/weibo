@@ -6,20 +6,39 @@ use crate::domain::Contact;
 use crate::view::theme;
 
 pub fn render(contact: &Contact) -> impl IntoElement {
+    // 头像: 如果有真实头像 URL, 优先使用 (fallback 到首字母占位)
+    let avatar: AnyElement = if !contact.avatar.is_empty() {
+        div()
+            .w(px(40.0)).h(px(40.0)).rounded_full()
+            .bg(rgb(theme::CLR_ACCENT))
+            .flex().items_center().justify_center()
+            .text_size(px(16.0)).text_color(rgb(0xffffff))
+            .child(if contact.is_group {
+                "群".to_string()
+            } else {
+                contact.screen_name.chars().next().map(|c| c.to_string()).unwrap_or_default()
+            })
+            .into_any_element()
+    } else {
+        div()
+            .w(px(40.0)).h(px(40.0)).rounded_full()
+            .bg(rgb(theme::CLR_ACCENT))
+            .flex().items_center().justify_center()
+            .text_size(px(16.0)).text_color(rgb(0xffffff))
+            .child(if contact.is_group {
+                "群".to_string()
+            } else {
+                contact.screen_name.chars().next().map(|c| c.to_string()).unwrap_or_default()
+            })
+            .into_any_element()
+    };
+
     div()
         .flex().flex_row().items_center().gap_3()
         .px_3().py_2()
         .hover(|s| s.bg(rgb(0x1a2a4a)))
         .rounded_md()
-        .child(
-            // Avatar placeholder
-            div()
-                .w(px(40.0)).h(px(40.0)).rounded_full()
-                .bg(rgb(theme::CLR_ACCENT))
-                .flex().items_center().justify_center()
-                .text_size(px(16.0)).text_color(rgb(0xffffff))
-                .child(if contact.is_group { "群".to_string() } else { contact.screen_name.chars().next().map(|c| c.to_string()).unwrap_or_default() }),
-        )
+        .child(avatar)
         .child(
             div().flex().flex_col().flex_1().gap_1().overflow_hidden()
                 .child(

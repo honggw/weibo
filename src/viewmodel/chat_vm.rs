@@ -1,6 +1,6 @@
 //! Chat ViewModel — conversation list + message loading + send.
 
-use crate::domain::{ChatMessage, Contact};
+use crate::domain::{ChatMessage, Contact, Emotion, GroupInfo};
 use crate::model::chat_service;
 use crate::viewmodel::root_vm::AppRoot;
 use crate::log_info;
@@ -25,6 +25,16 @@ pub struct ChatData {
     pub input_focus: Option<FocusHandle>,
     /// List state for message rendering (virtual scroll)
     pub msg_list_state: Option<ListState>,
+    /// 表情列表 (懒加载缓存)
+    pub emotions: Vec<Emotion>,
+    /// 是否显示表情面板
+    pub show_emoji_panel: bool,
+    /// 会话搜索文本
+    pub search_text: String,
+    /// 搜索过滤后的联系人
+    pub filtered_contacts: Vec<Contact>,
+    /// 当前群信息 (群聊时)
+    pub group_info: Option<GroupInfo>,
 }
 
 impl ChatData {
@@ -33,6 +43,9 @@ impl ChatData {
             contacts: Vec::new(), loading: true, my_uid: String::new(),
             selected_uid: None, messages: Vec::new(), messages_loading: false,
             oldest_mid: None, has_more: true, draft_text: String::new(), input_focus: None, msg_list_state: None,
+            emotions: Vec::new(), show_emoji_panel: false,
+            search_text: String::new(), filtered_contacts: Vec::new(),
+            group_info: None,
         }
     }
 }
@@ -72,9 +85,11 @@ pub fn select_contact(cx: &mut Context<AppRoot>, handle: &tokio::runtime::Handle
         async move {
             let messages = handle.block_on(chat_service::fetch_messages(&uid, &my_uid, is_group, None));
 
+            let uid_for_selected = uid.clone();
+            let uid_for_report = uid.clone();
             this.update(&mut cx, |v, cx| {
                 if let Some(chat) = v.chat_data.as_mut() {
-                    chat.selected_uid = Some(uid);
+                    chat.selected_uid = Some(uid_for_selected);
                     // Store oldest message ID for pagination
                     chat.oldest_mid = messages.first().map(|m| m.id.clone());
                     chat.has_more = messages.len() >= 30; // API returns up to 30 per page
@@ -82,10 +97,24 @@ pub fn select_contact(cx: &mut Context<AppRoot>, handle: &tokio::runtime::Handle
                     chat.messages_loading = false;
                     let count = chat.messages.len();
                     log_info!("[chat_vm] 加载 {} 条消息, oldest_mid={:?}, has_more={}", count, chat.oldest_mid, chat.has_more);
-                    chat.msg_list_state = Some(ListState::new(count, ListAlignment::Top, px(50.0)));
+                    chat.msg_list_state = Some(ListState::new(count, ListAlignment::Bottom, px(50.0)));
                 }
                 cx.notify();
             }).ok();
+
+            // Fetch group info in background
+            if is_group {
+                let gid = uid;
+                tokio::spawn(async move {
+                    if let Some(info) = chat_service::fetch_group_info(&gid).await {
+                        log_info!("[chat_vm] 群信息已获取: {:?}", info.name);
+                    }
+                });
+            }
+            // Report read status
+            tokio::spawn(async move {
+                chat_service::report_read(&uid_for_report).await;
+            });
         }
     }).detach();
 }

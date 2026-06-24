@@ -183,18 +183,37 @@ pub async fn fetch_group_messages(
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("?")
                                 .to_string();
+                            let avatar = m
+                                .get("from_user")
+                                .and_then(|u| u.get("profile_image_url"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
                             let text = m
                                 .get("content")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string();
                             let ts = m.get("time").and_then(|v| v.as_u64()).unwrap_or(0);
-                            // Convert Unix timestamp to readable string
-                            use std::time::{Duration, UNIX_EPOCH};
-                            let time_str = UNIX_EPOCH
-                                .checked_add(Duration::from_secs(ts))
-                                .map(|t| format!("{:?}", t))
+                            let time_str = format_timestamp(ts);
+                            let type_val = m.get("type").and_then(|v| v.as_u64()).unwrap_or(321);
+                            let media_val = m.get("media_type").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let role = m.get("from_user_role")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0) as u8;
+                            // 解析图片 fids: "[5312697042208502]" -> vec!["5312697042208502"]
+                            let fids = m
+                                .get("fids")
+                                .and_then(|v| v.as_str())
+                                .map(|s| {
+                                    s.trim_matches(|c| c == '[' || c == ']')
+                                        .split(',')
+                                        .filter(|s| !s.is_empty())
+                                        .map(|s| s.trim().to_string())
+                                        .collect::<Vec<_>>()
+                                })
                                 .unwrap_or_default();
+
                             crate::domain::ChatMessage {
                                 id: m
                                     .get("id")
@@ -203,9 +222,15 @@ pub async fn fetch_group_messages(
                                     .unwrap_or_default(),
                                 sender_id: sid.clone(),
                                 sender_name: name,
+                                sender_avatar: avatar,
                                 text,
                                 created_at: time_str,
+                                timestamp: ts,
                                 is_self: sid == my_uid,
+                                msg_type: crate::domain::MsgType::from_api(type_val),
+                                media_type: crate::domain::MediaType::from_api(media_val),
+                                fids,
+                                role,
                             }
                         })
                         .collect();
@@ -257,6 +282,23 @@ pub async fn fetch_messages(
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(0)
                                 .to_string();
+                            let media_val = m.get("media_type").and_then(|v| v.as_u64()).unwrap_or(0);
+                            // DM 的 type 来自 group_chat_message_type
+                            let type_val = m
+                                .get("group_chat_message_type")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(321);
+                            let fids_str = m.get("fids").and_then(|v| v.as_str()).unwrap_or("");
+                            let fids = fids_str
+                                .trim_matches(|c| c == '[' || c == ']')
+                                .split(',')
+                                .filter(|s| !s.is_empty())
+                                .map(|s| s.trim().to_string())
+                                .collect::<Vec<_>>();
+                            let role = m.get("sender_role")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0) as u8;
+
                             crate::domain::ChatMessage {
                                 id: m
                                     .get("idstr")
@@ -269,6 +311,7 @@ pub async fn fetch_messages(
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("?")
                                     .to_string(),
+                                sender_avatar: String::new(), // DM 接口不含头像, 后续可通过 users/show 补全
                                 text: m
                                     .get("text")
                                     .and_then(|v| v.as_str())
@@ -279,7 +322,12 @@ pub async fn fetch_messages(
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("")
                                     .to_string(),
+                                timestamp: 0, // DM 接口是字符串时间, 可后续解析
                                 is_self: sid == my_uid,
+                                msg_type: crate::domain::MsgType::from_api(type_val),
+                                media_type: crate::domain::MediaType::from_api(media_val),
+                                fids,
+                                role,
                             }
                         })
                         .collect();
@@ -362,7 +410,14 @@ async fn send_dm_message(uid: &str, text: &str) -> Option<crate::domain::ChatMes
                     created_at,
                     sender_id: my_uid,
                     sender_name: "我".to_string(),
+                    sender_avatar: String::new(),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
                     is_self: true,
+                    msg_type: crate::domain::MsgType::Normal,
+                    media_type: crate::domain::MediaType::Text,
+                    fids: vec![],
+                    role: 0,
                 });
             }
         }
@@ -391,7 +446,15 @@ async fn send_group_message(gid: &str, text: &str) -> Option<crate::domain::Chat
                 log_info!("[chat] Group 已发送: id={}", id);
                 return Some(crate::domain::ChatMessage {
                     id, text: text.to_string(), created_at: String::new(),
-                    sender_id: String::new(), sender_name: "我".to_string(), is_self: true,
+                    sender_id: String::new(), sender_name: "我".to_string(),
+                    sender_avatar: String::new(),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                    is_self: true,
+                    msg_type: crate::domain::MsgType::Normal,
+                    media_type: crate::domain::MediaType::Text,
+                    fids: vec![],
+                    role: 0,
                 });
             }
         }
@@ -523,4 +586,207 @@ fn parse_contact(c: &serde_json::Value) -> Option<Contact> {
         last_time: time,
         is_group,
     })
+}
+
+/// 将 Unix 时间戳格式化为可读时间字符串。
+/// 今天的消息只显示 "HH:MM", 昨天显示 "昨天 HH:MM", 其他日期显示 "MM-DD HH:MM"。
+fn format_timestamp(ts: u64) -> String {
+    if ts == 0 {
+        return String::new();
+    }
+    // 东八区偏移 (秒)
+    let tz_offset: i64 = 8 * 3600;
+    let local_ts = ts as i64 + tz_offset;
+    let secs_in_day: i64 = 86400;
+
+    // 获取当前本地时间 (近似: SystemTime + 东八区偏移)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+        + tz_offset;
+
+    let msg_day = local_ts / secs_in_day;
+    let now_day = now / secs_in_day;
+    let hour = ((local_ts % secs_in_day) / 3600) as u32;
+    let minute = ((local_ts % 3600) / 60) as u32;
+
+    if msg_day == now_day {
+        format!("{:02}:{:02}", hour, minute)
+    } else if msg_day == now_day - 1 {
+        format!("昨天 {:02}:{:02}", hour, minute)
+    } else {
+        // 简易月/日计算 (近似)
+        let days_since_year_start = local_ts % (365 * secs_in_day);
+        let month_approx = (days_since_year_start / (30 * secs_in_day)) + 1;
+        let day_approx = ((days_since_year_start % (30 * secs_in_day)) / secs_in_day) + 1;
+        format!(
+            "{:02}-{:02} {:02}:{:02}",
+            month_approx.min(12).max(1),
+            day_approx.min(31).max(1),
+            hour,
+            minute
+        )
+    }
+}
+
+/// 获取微博表情列表
+pub async fn fetch_emotions() -> Vec<crate::domain::Emotion> {
+    let (cookie, _xsrf) = chat_headers();
+    let url = format!("{}/webim/emotions.json?source={}", CHAT_BASE, SOURCE);
+
+    let client = http_client::build_no_store();
+    match client
+        .get(&url)
+        .header("Cookie", &cookie)
+        .header("Referer", format!("{}/chat", CHAT_BASE))
+        .header("User-Agent", config::DEFAULT_UA)
+        .timeout(config::REQUEST_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            if let Ok(arr) = resp.json::<Vec<serde_json::Value>>().await {
+                return arr
+                    .iter()
+                    .filter_map(|e| {
+                        let phrase = e.get("phrase")?.as_str()?.to_string();
+                        let url = e.get("url")?.as_str()?.to_string();
+                        Some(crate::domain::Emotion { phrase, url })
+                    })
+                    .collect();
+            }
+        }
+        Err(e) => log_info!("[chat] 获取表情失败: {}", e),
+    }
+    Vec::new()
+}
+
+/// 上报已读状态 (进入/切换会话时调用)
+pub async fn report_read(uid: &str) {
+    let (cookie, xsrf) = chat_headers();
+    let url = format!("{}/webim/report.json", CHAT_BASE);
+    let client = http_client::build_no_store();
+
+    let data_json = serde_json::json!({
+        "type": 2,
+        "uid": uid,
+    });
+    let params = format!(
+        "data={}&source={}",
+        url::form_urlencoded::byte_serialize(data_json.to_string().as_bytes())
+            .collect::<String>(),
+        SOURCE
+    );
+
+    match client
+        .post(&url)
+        .header("Cookie", &cookie)
+        .header("Referer", format!("{}/chat", CHAT_BASE))
+        .header("User-Agent", config::DEFAULT_UA)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("X-XSRF-TOKEN", &xsrf)
+        .body(params)
+        .timeout(config::REQUEST_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(_) => log_info!("[chat] 已读上报: uid={}", uid),
+        Err(e) => log_info!("[chat] 已读上报失败: {}", e),
+    }
+}
+
+/// 获取群详情 (成员列表/群名/管理员等)
+/// API: GET /webim/query_group.json?is_pc=1&query_member=1&sort_by_jp=1&query_member_count=5000&id={gid}&source=209678993
+pub async fn fetch_group_info(gid: &str) -> Option<crate::domain::GroupInfo> {
+    let (cookie, _xsrf) = chat_headers();
+    let url = format!(
+        "{}/webim/query_group.json?is_pc=1&query_member=1&sort_by_jp=1&query_member_count=5000&id={}&source={}",
+        CHAT_BASE, gid, SOURCE
+    );
+
+    let client = http_client::build_no_store();
+    match client
+        .get(&url)
+        .header("Cookie", &cookie)
+        .header("Referer", format!("{}/chat", CHAT_BASE))
+        .header("User-Agent", config::DEFAULT_UA)
+        .timeout(config::REQUEST_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            if let Ok(data) = resp.json::<serde_json::Value>().await {
+                let id = data
+                    .get("id")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                let name = data
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string();
+                let owner_uid = data
+                    .get("owner_uid")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                let member_count = data
+                    .get("member_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let members: Vec<crate::domain::GroupMember> = data
+                    .get("members")
+                    .and_then(|m| m.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|m| {
+                                let uid = m
+                                    .get("uid")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_default();
+                                let screen_name = m
+                                    .get("screen_name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?")
+                                    .to_string();
+                                let avatar = m
+                                    .get("profile_image_url")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let is_admin = m
+                                    .get("is_admin")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                Some(crate::domain::GroupMember {
+                                    uid,
+                                    screen_name,
+                                    avatar,
+                                    is_admin,
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                log_info!(
+                    "[chat] 获取群信息: name={}, members={}",
+                    name,
+                    members.len()
+                );
+                return Some(crate::domain::GroupInfo {
+                    id,
+                    name,
+                    owner_uid,
+                    member_count,
+                    members,
+                });
+            }
+        }
+        Err(e) => log_info!("[chat] 获取群信息失败: {}", e),
+    }
+    None
 }

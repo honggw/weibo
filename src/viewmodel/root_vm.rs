@@ -98,9 +98,29 @@ impl AppRoot {
             id: String::new(),
             sender_id,
             sender_name,
+            sender_avatar: msg.data.get("from_user")
+                .and_then(|u| u.get("profile_image_url"))
+                .and_then(|v| v.as_str()).unwrap_or("").to_string(),
             text: text.clone(),
             created_at: String::new(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
             is_self,
+            msg_type: crate::domain::MsgType::from_api(
+                msg.data.get("type").and_then(|v| v.as_u64()).unwrap_or(321)
+            ),
+            media_type: crate::domain::MediaType::from_api(
+                msg.data.get("media_type").and_then(|v| v.as_u64()).unwrap_or(0)
+            ),
+            fids: msg.data.get("fids")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim_matches(|c| c == '[' || c == ']')
+                    .split(',').filter(|s| !s.is_empty())
+                    .map(|s| s.trim().to_string()).collect())
+                .unwrap_or_default(),
+            role: msg.data.get("from_user_role")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u8,
         };
 
         // If this contact is currently selected, append to message list
@@ -108,7 +128,7 @@ impl AppRoot {
             chat.messages.push(new_msg);
             if let Some(ref lst) = chat.msg_list_state {
                 // Note: ListState doesn't have an easy way to increment, so we recreate
-                chat.msg_list_state = Some(ListState::new(chat.messages.len(), ListAlignment::Top, px(50.0)));
+                chat.msg_list_state = Some(ListState::new(chat.messages.len(), ListAlignment::Bottom, px(50.0)));
             }
             log_info!("[ws] 已追加消息到当前会话: {}", text.chars().take(20).collect::<String>());
         }
@@ -119,6 +139,11 @@ impl AppRoot {
             if !is_self {
                 contact.unread_count += 1;
             }
+        }
+
+        // 非自己的消息播放提示音
+        if !is_self {
+            crate::infra::audio::play_notification();
         }
 
         log_info!("[ws] 推送处理完成: channel={}, contact={}", channel, contact_uid);

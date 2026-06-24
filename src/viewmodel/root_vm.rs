@@ -128,8 +128,8 @@ impl AppRoot {
         // If this contact is currently selected, append to message list
         if chat.selected_uid.as_ref() == Some(&contact_uid) {
             chat.messages.push(new_msg);
-            // Always rebuild ListState after push (not gated on existing state)
-            crate::viewmodel::chat_vm::rebuild_msg_list_state(chat, ListAlignment::Bottom);
+            // Incrementally update ListState (preserves cached item heights)
+            crate::viewmodel::chat_vm::update_msg_list_state_append(chat);
             log_info!("[ws] 已追加消息到当前会话: {}", text.chars().take(20).collect::<String>());
         }
 

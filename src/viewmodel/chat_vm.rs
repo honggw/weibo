@@ -69,10 +69,38 @@ pub fn count_list_items(msgs: &[ChatMessage]) -> usize {
     msgs.len() + separators
 }
 
-/// 重建 msg_list_state, 使用包含 TimeSeparator 的真实项数。
+/// 创建全新的 msg_list_state（切换会话、批量加载时使用）。
+/// 当消息列表整体替换时，旧的 item 高度缓存不再有效，必须从头测量。
 pub fn rebuild_msg_list_state(chat: &mut ChatData, alignment: ListAlignment) {
-    let item_count = count_list_items(&chat.messages);
-    chat.msg_list_state = Some(ListState::new(item_count, alignment, px(400.0)));
+    let new_count = count_list_items(&chat.messages);
+    chat.msg_list_state = Some(ListState::new(new_count, alignment, px(400.0)));
+}
+
+/// 增量更新 msg_list_state 的 item_count（追加/接收单条消息时使用）。
+/// 通过 splice 保留已缓存的 item 高度，避免已测量区域重新测量导致布局跳动。
+pub fn update_msg_list_state_append(chat: &mut ChatData) {
+    let new_count = count_list_items(&chat.messages);
+    if let Some(ref lst) = chat.msg_list_state {
+        let old_count = lst.item_count();
+        if new_count > old_count {
+            // 在尾部追加新 item (Unmeasured)
+            lst.splice(old_count..old_count, new_count - old_count);
+        }
+    } else {
+        chat.msg_list_state = Some(ListState::new(new_count, ListAlignment::Bottom, px(400.0)));
+    }
+}
+
+/// 增量更新 msg_list_state — 在头部插入（加载历史消息时使用）。
+/// 保留已缓存的 item 高度，在列表头部插入 Unmeasured 项。
+pub fn update_msg_list_state_prepend(chat: &mut ChatData, prepended_item_count: usize) {
+    if let Some(ref lst) = chat.msg_list_state {
+        // 在头部(index 0)插入 prepended_item_count 个新 item
+        lst.splice(0..0, prepended_item_count);
+    } else {
+        let new_count = count_list_items(&chat.messages);
+        chat.msg_list_state = Some(ListState::new(new_count, ListAlignment::Bottom, px(400.0)));
+    }
 }
 
 /// Spawn loading contacts list.
@@ -170,6 +198,10 @@ pub fn load_more_messages(cx: &mut Context<AppRoot>, handle: &tokio::runtime::Ha
                     chat.messages_loading = false;
                     let count = older.len();
                     if count > 0 {
+                        // Record old item count before prepending
+                        let old_item_count = chat.msg_list_state.as_ref()
+                            .map(|lst| lst.item_count())
+                            .unwrap_or(0);
                         // Update oldest_mid for next pagination
                         chat.oldest_mid = older.first().map(|m| m.id.clone());
                         chat.has_more = count >= 30;
@@ -177,8 +209,10 @@ pub fn load_more_messages(cx: &mut Context<AppRoot>, handle: &tokio::runtime::Ha
                         let mut all = older;
                         all.append(&mut chat.messages);
                         chat.messages = all;
-                        // Use Top alignment to maintain scroll position when loading older messages
-                        rebuild_msg_list_state(chat, ListAlignment::Top);
+                        // Calculate new total and splice in the difference at the head
+                        let new_item_count = count_list_items(&chat.messages);
+                        let prepended = new_item_count.saturating_sub(old_item_count);
+                        update_msg_list_state_prepend(chat, prepended);
                         log_info!("[chat_vm] 加载更早 {} 条消息, 总计 {} 条, has_more={}", count, chat.messages.len(), chat.has_more);
                     } else {
                         chat.has_more = false;
@@ -203,8 +237,8 @@ pub fn send_message(cx: &mut Context<AppRoot>, handle: &tokio::runtime::Handle, 
                 if let Some(chat) = v.chat_data.as_mut() {
                     if let Some(msg) = sent {
                         chat.messages.push(msg);
-                        // Rebuild ListState so new message is visible (Accounts for TimeSeparators)
-                        rebuild_msg_list_state(chat, ListAlignment::Bottom);
+                        // Incrementally append to ListState (preserves cached item heights)
+                        update_msg_list_state_append(chat);
                     }
                 }
                 cx.notify();

@@ -1,400 +1,349 @@
-# 微博 PC 客户端 - 聊天界面改造计划
+# 微博 PC 客户端 - 聊天界面 Bug 修复计划
 
-> 基于 `weibo_web.png` (微博网页聊天截图) 和 `api.weibo.com_chat_conversation0.har` (抓包数据) 分析得出。
+> 基于 `failed.png` 截图分析的 4 个 UI 问题，结合 `review.md` 中的代码审查结论。
 
 ---
 
-## 第一阶段：核心体验 (消息展示 + 实时通信)
+## 问题一览
 
-### 1.1 扩展 Domain Model — `ChatMessage` 增加消息类型字段
+| # | 问题描述 | 根因 | 涉及文件 |
+|---|---------|------|---------|
+| 1 | 未读数角标被拉长 | `rounded_full` + 无固定最小宽高，数字较长时胶囊变形 | `contact_card.rs` |
+| 2 | 聊天消息互相覆盖 | ListState item_count 与实际项数不一致 + 估算行高过小 | `chat_vm.rs`, `chat_screen.rs`, `root_vm.rs` |
+| 3 | 图片渲染失败 | `fids` 解析逻辑错误(JSON array 被 `as_str()`) + 占位图无内容 | `chat_service.rs`, `message_bubble.rs` |
+| 4 | 滚轮无法触发加载更多 | 消息列表无 scroll_handler，仅有手动按钮 | `chat_screen.rs`, `chat_vm.rs` |
 
-**文件**: `src/domain/mod.rs`
+---
 
-**改动说明**: 当前 `ChatMessage` 只有纯文本字段，无法区分图片、引用、撤回、系统通知等消息类型。需新增 `msg_type`、`media_type`、`fids`、`sender_avatar`、`attitude_info` 等字段。
+## 修复一: 未读数角标拉长
+
+### 1.1 问题分析
+
+截图中右侧会话列表的未读数角标（如 "22"、"3"）被水平拉长，变成了椭圆/长条形状。
+
+**根因**: `contact_card.rs` 第 57 行：
+```rust
+div().px_2().py_0p5().rounded_full().bg(rgb(theme::CLR_ACCENT))
+    .text_size(px(11.0)).text_color(rgb(0xffffff))
+    .child(format!("{}", contact.unread_count))
+```
+
+- `rounded_full()` 的圆角是 9999px，在正方形上显示为圆形，但在矩形上显示为胶囊。
+- 没有设置 `min_w` / `h` / `items_center` / `justify_center`，内容区域由文本撑开，两位数以上就变形。
+
+### 1.2 修复方案
+
+**文件**: `src/view/widgets/contact_card.rs` 第 56-61 行
 
 **当前代码**:
 ```rust
-#[derive(Clone, Debug)]
-pub struct ChatMessage {
-    pub id: String,
-    pub sender_id: String,
-    pub sender_name: String,
-    pub text: String,
-    pub created_at: String,
-    pub is_self: bool,
+.child(if contact.unread_count > 0 {
+    div().px_2().py_0p5().rounded_full().bg(rgb(theme::CLR_ACCENT))
+        .text_size(px(11.0)).text_color(rgb(0xffffff))
+        .child(format!("{}", contact.unread_count))
+        .into_any_element()
+} else {
+    div().into_any_element()
+})
+```
+
+**改为**:
+```rust
+.child(if contact.unread_count > 0 {
+    let text = if contact.unread_count > 99 {
+        "99+".to_string()
+    } else {
+        format!("{}", contact.unread_count)
+    };
+    div()
+        .min_w(px(18.0))   // 最小宽度，保证单位数也是圆形
+        .h(px(18.0))       // 固定高度
+        .flex()            // 启用 flex 以便居中
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .bg(rgb(theme::CLR_ACCENT))
+        .text_size(px(10.0))
+        .text_color(rgb(0xffffff))
+        .flex_shrink_0()   // 不被父容器压缩
+        .child(text)
+        .into_any_element()
+} else {
+    div().into_any_element()
+})
+```
+
+**关键改动**:
+- `min_w(px(18.0))` + `h(px(18.0))` 保证单位数时是正圆
+- `flex()` + `items_center()` + `justify_center()` 让文字居中
+- `flex_shrink_0()` 防止被父级 `justify_between` 压缩
+- `text_size` 减小到 10px 避免撑破容器
+- 超过 99 截断为 "99+"
+
+---
+
+## 修复二: 聊天消息互相覆盖
+
+### 2.1 问题分析
+
+截图中可明显看到多条消息的气泡在垂直方向上重叠，文字互相遮挡。
+
+**根因（3 重叠加）**:
+
+1. **ListState item_count 不匹配**: `ListState::new(count, ...)` 中 `count` 是 `chat.messages.len()` (原始消息数)，但渲染时 `build_list_items()` 会插入 `TimeSeparator` 使实际项数更多。GPUI 只分配 `count` 个 slot 的布局空间，多余的项被挤压/重叠。
+
+2. **overdraw 过小**: `ListState::new(count, ..., px(50.0))` 的 overdraw=50px，意味着 GPUI 只预渲染可视区域上下 50px 的项。消息气泡（尤其带引用的）高度远超 50px，导致测量不足、布局错位。
+
+3. **send_message 后不更新 ListState**: 发消息追加后 ListState 不知道新增了项，下次渲染时内部状态错乱。
+
+### 2.2 修复方案
+
+#### 2.2.1 统一 ListState 创建逻辑 — 新增辅助函数
+
+**文件**: `src/viewmodel/chat_vm.rs`
+
+在文件顶部（`ChatData` 结构体定义之后）新增:
+
+```rust
+/// 计算包含时间分割线的消息列表真实项数。
+/// 规则: 第一条消息前 + 间隔超过 300 秒的相邻消息之间，各插入一条 TimeSeparator。
+pub fn compute_list_item_count(messages: &[ChatMessage]) -> usize {
+    let mut count = messages.len();
+    for (i, msg) in messages.iter().enumerate() {
+        if i == 0 {
+            if msg.timestamp > 0 {
+                count += 1;
+            }
+        } else if msg.timestamp > 0 && messages[i - 1].timestamp > 0
+            && msg.timestamp.saturating_sub(messages[i - 1].timestamp) > 300
+        {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// 为消息列表创建/重建 ListState，使用正确的 item_count 和 overdraw。
+pub fn rebuild_msg_list_state(messages: &[ChatMessage], alignment: ListAlignment) -> ListState {
+    let count = compute_list_item_count(messages);
+    // overdraw 设为 400px: 消息气泡最高约 200px (引用+长文本), 需要至少预渲染 2 条
+    ListState::new(count, alignment, px(400.0))
+}
+```
+
+#### 2.2.2 修改 `select_contact` — 使用正确的 item_count
+
+**文件**: `src/viewmodel/chat_vm.rs` 第 100 行
+
+**当前**:
+```rust
+chat.msg_list_state = Some(ListState::new(count, ListAlignment::Bottom, px(50.0)));
+```
+
+**改为**:
+```rust
+chat.msg_list_state = Some(rebuild_msg_list_state(&chat.messages, ListAlignment::Bottom));
+```
+
+#### 2.2.3 修改 `load_more_messages` — 使用正确的 item_count
+
+**文件**: `src/viewmodel/chat_vm.rs` 第 141 行
+
+**当前**:
+```rust
+chat.msg_list_state = Some(ListState::new(chat.messages.len(), ListAlignment::Top, px(50.0)));
+```
+
+**改为**:
+```rust
+chat.msg_list_state = Some(rebuild_msg_list_state(&chat.messages, ListAlignment::Top));
+```
+
+#### 2.2.4 修改 `send_message` — 追加消息后更新 ListState
+
+**文件**: `src/viewmodel/chat_vm.rs` 第 162-166 行
+
+**当前**:
+```rust
+if let Some(msg) = sent {
+    chat.messages.push(msg);
 }
 ```
 
 **改为**:
 ```rust
-/// 消息类型枚举 (来自 HAR 中 type 字段)
-#[derive(Clone, Debug, PartialEq)]
-pub enum MsgType {
-    /// 普通消息 (type=321)
-    Normal,
-    /// 系统消息: 入群通知等 (type=322)
-    System,
-    /// 撤回消息 (type=344)
-    Recall,
-    /// 其他未知类型
-    Other(u64),
-}
-
-impl MsgType {
-    pub fn from_api(type_val: u64) -> Self {
-        match type_val {
-            321 => MsgType::Normal,
-            322 => MsgType::System,
-            344 => MsgType::Recall,
-            v   => MsgType::Other(v),
-        }
-    }
-}
-
-/// 媒体类型枚举 (来自 HAR 中 media_type 字段)
-#[derive(Clone, Debug, PartialEq)]
-pub enum MediaType {
-    /// 纯文本 (media_type=0)
-    Text,
-    /// 图片 (media_type=1, 有 fids 字段)
-    Image,
-    /// 引用/转发 (media_type=14, content 中包含引用块)
-    Quote,
-    /// 其他
-    Other(u64),
-}
-
-impl MediaType {
-    pub fn from_api(val: u64) -> Self {
-        match val {
-            0  => MediaType::Text,
-            1  => MediaType::Image,
-            14 => MediaType::Quote,
-            v  => MediaType::Other(v),
-        }
-    }
-}
-
-/// 单条聊天消息
-#[derive(Clone, Debug)]
-pub struct ChatMessage {
-    pub id: String,
-    pub sender_id: String,
-    pub sender_name: String,
-    /// 发送者头像 URL (来自 from_user.profile_image_url)
-    pub sender_avatar: String,
-    pub text: String,
-    pub created_at: String,
-    /// Unix 时间戳 (秒), 用于时间分组和格式化
-    pub timestamp: u64,
-    pub is_self: bool,
-    /// 消息类型: Normal / System / Recall
-    pub msg_type: MsgType,
-    /// 媒体类型: Text / Image / Quote
-    pub media_type: MediaType,
-    /// 图片消息的文件 ID 列表 (media_type=1 时非空)
-    /// 用于拼接缩略图 URL: https://upload.api.weibo.com/2/mss/msget_thumbnail?fid={}&high=240&width=240&source=209678993
-    pub fids: Vec<String>,
+if let Some(msg) = sent {
+    chat.messages.push(msg);
+    chat.msg_list_state = Some(rebuild_msg_list_state(&chat.messages, ListAlignment::Bottom));
 }
 ```
 
+#### 2.2.5 修改 `root_vm.rs` `handle_ws_message` — WS 推送也更新 ListState
+
+**文件**: `src/viewmodel/root_vm.rs` 第 127-132 行
+
+**当前**:
+```rust
+if chat.selected_uid.as_ref() == Some(&contact_uid) {
+    chat.messages.push(new_msg);
+    if let Some(ref lst) = chat.msg_list_state {
+        chat.msg_list_state = Some(ListState::new(chat.messages.len(), ListAlignment::Bottom, px(50.0)));
+    }
+}
+```
+
+**改为**:
+```rust
+if chat.selected_uid.as_ref() == Some(&contact_uid) {
+    chat.messages.push(new_msg);
+    // 始终重建 ListState (不论之前是否为 Some)
+    chat.msg_list_state = Some(
+        crate::viewmodel::chat_vm::rebuild_msg_list_state(&chat.messages, ListAlignment::Bottom)
+    );
+}
+```
+
+#### 2.2.6 `chat_screen.rs` — 渲染时校验 item_count（防御性）
+
+**文件**: `src/view/screens/chat_screen.rs` 第 306-332 行
+
+在使用 `msg_list_state` 前，检测实际 item count 是否匹配:
+
+**当前**:
+```rust
+.child(if !msgs.is_empty() {
+    if let Some(lst) = msg_list_state {
+        let items_for_list = list_items.clone();
+        list(lst, move |ix, _window, _cx| { ... })
+```
+
+**改为**:
+```rust
+.child(if !msgs.is_empty() {
+    if let Some(lst) = msg_list_state {
+        let items_for_list = list_items.clone();
+        let actual_count = items_for_list.len();
+        // 防御性校验: 如果 ListState 的 item_count 与实际不符, splice 修正
+        let state_count = lst.item_count();
+        if state_count != actual_count {
+            if state_count < actual_count {
+                lst.splice(state_count..state_count, actual_count - state_count);
+            } else {
+                lst.splice(actual_count..state_count, 0);
+            }
+        }
+        list(lst, move |ix, _window, _cx| { ... })
+```
+
+> 注: `lst.item_count()` 和 `lst.splice()` 是 GPUI `ListState` 的公开 API。
+
 ---
 
-### 1.2 `chat_service.rs` — 解析新增字段
+## 修复三: 图片渲染失败
+
+### 3.1 问题分析
+
+截图中看到图片消息区域显示为空白/灰色块，而非预期的 "🖼" 占位图标。
+
+**根因**:
+1. `fids` 解析使用 `as_str()`，但 API 返回的是 JSON 数组 `[5312697042208502]`（`Value::Array`），所以 `as_str()` 永远返回 `None`，`fids` 为空。
+2. 当 `fids` 为空时，`media_type` 仍然是 `Image`（因为 `media_type=1`），进入 `render_image_bubble`。但该函数目前只渲染一个固定大小的灰色块 + 文字，在某些布局条件下可能被压缩不可见。
+
+### 3.2 修复方案
+
+#### 3.2.1 修复 fids 解析 — 正确处理 JSON array
 
 **文件**: `src/model/chat_service.rs`
 
-#### 1.2.1 修改 `fetch_group_messages` 解析逻辑
+**位置 1**: `fetch_group_messages` 第 204-215 行
 
-**当前代码** (第 173-209 行):
+**当前**:
 ```rust
-return arr.iter().map(|m| {
-    let sid = m.get("from_uid").and_then(|v| v.as_u64()).unwrap_or(0).to_string();
-    let name = m.get("from_user").and_then(|u| u.get("screen_name"))
-        .and_then(|v| v.as_str()).unwrap_or("?").to_string();
-    let text = m.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let ts = m.get("time").and_then(|v| v.as_u64()).unwrap_or(0);
-    use std::time::{Duration, UNIX_EPOCH};
-    let time_str = UNIX_EPOCH.checked_add(Duration::from_secs(ts))
-        .map(|t| format!("{:?}", t)).unwrap_or_default();
-    crate::domain::ChatMessage {
-        id: m.get("id").and_then(|v| v.as_u64()).map(|v| v.to_string()).unwrap_or_default(),
-        sender_id: sid.clone(),
-        sender_name: name,
-        text,
-        created_at: time_str,
-        is_self: sid == my_uid,
-    }
-}).collect();
+let fids = m
+    .get("fids")
+    .and_then(|v| v.as_str())
+    .map(|s| {
+        s.trim_matches(|c| c == '[' || c == ']')
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.trim().to_string())
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
 ```
 
 **改为**:
 ```rust
-return arr.iter().map(|m| {
-    let sid = m.get("from_uid").and_then(|v| v.as_u64()).unwrap_or(0).to_string();
-    let name = m.get("from_user")
-        .and_then(|u| u.get("screen_name"))
-        .and_then(|v| v.as_str()).unwrap_or("?").to_string();
-    let avatar = m.get("from_user")
-        .and_then(|u| u.get("profile_image_url"))
-        .and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let text = m.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let ts = m.get("time").and_then(|v| v.as_u64()).unwrap_or(0);
-    let time_str = format_timestamp(ts);
-    let type_val = m.get("type").and_then(|v| v.as_u64()).unwrap_or(321);
-    let media_val = m.get("media_type").and_then(|v| v.as_u64()).unwrap_or(0);
-    // 解析图片 fids: "[5312697042208502]" -> vec!["5312697042208502"]
-    let fids = m.get("fids")
-        .and_then(|v| v.as_str())
-        .map(|s| {
-            s.trim_matches(|c| c == '[' || c == ']')
+let fids = m.get("fids")
+    .and_then(|v| {
+        // API 返回 JSON array: [5312697042208502]
+        if let Some(arr) = v.as_array() {
+            Some(arr.iter()
+                .filter_map(|item| {
+                    item.as_u64().map(|n| n.to_string())
+                        .or_else(|| item.as_str().map(|s| s.to_string()))
+                })
+                .collect::<Vec<_>>())
+        } else if let Some(s) = v.as_str() {
+            // 兼容字符串格式: "[123,456]"
+            Some(s.trim_matches(|c| c == '[' || c == ']')
                 .split(',')
                 .filter(|s| !s.is_empty())
                 .map(|s| s.trim().to_string())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    crate::domain::ChatMessage {
-        id: m.get("id").and_then(|v| v.as_u64()).map(|v| v.to_string()).unwrap_or_default(),
-        sender_id: sid.clone(),
-        sender_name: name,
-        sender_avatar: avatar,
-        text,
-        created_at: time_str,
-        timestamp: ts,
-        is_self: sid == my_uid,
-        msg_type: crate::domain::MsgType::from_api(type_val),
-        media_type: crate::domain::MediaType::from_api(media_val),
-        fids,
-    }
-}).collect();
+                .collect())
+        } else {
+            None
+        }
+    })
+    .unwrap_or_default();
 ```
 
-#### 1.2.2 修改 `fetch_messages` (DM) 解析逻辑
+**位置 2**: `fetch_messages` (DM) 第 291-297 行
 
-**当前代码** (第 253-285 行):
+**当前**:
 ```rust
-return arr.iter().rev().map(|m| {
-    let sid = m.get("sender_id").and_then(|v| v.as_u64()).unwrap_or(0).to_string();
-    crate::domain::ChatMessage {
-        id: m.get("idstr").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        sender_id: sid.clone(),
-        sender_name: m.get("sender_screen_name").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
-        text: m.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        created_at: m.get("created_at").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        is_self: sid == my_uid,
-    }
-}).collect();
+let fids_str = m.get("fids").and_then(|v| v.as_str()).unwrap_or("");
+let fids = fids_str
+    .trim_matches(|c| c == '[' || c == ']')
+    .split(',')
+    .filter(|s| !s.is_empty())
+    .map(|s| s.trim().to_string())
+    .collect::<Vec<_>>();
 ```
 
-**改为**:
+**改为** (同样逻辑):
 ```rust
-return arr.iter().rev().map(|m| {
-    let sid = m.get("sender_id").and_then(|v| v.as_u64()).unwrap_or(0).to_string();
-    let media_val = m.get("media_type").and_then(|v| v.as_u64()).unwrap_or(0);
-    // DM 的 type 来自 group_chat_message_type 或 dm_type
-    let type_val = m.get("group_chat_message_type")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(321);
-    let fids_str = m.get("fids").and_then(|v| v.as_str()).unwrap_or("");
-    let fids = fids_str.trim_matches(|c| c == '[' || c == ']')
-        .split(',')
-        .filter(|s| !s.is_empty())
-        .map(|s| s.trim().to_string())
-        .collect::<Vec<_>>();
-
-    crate::domain::ChatMessage {
-        id: m.get("idstr").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        sender_id: sid.clone(),
-        sender_name: m.get("sender_screen_name")
-            .and_then(|v| v.as_str()).unwrap_or("?").to_string(),
-        sender_avatar: String::new(), // DM 接口不含头像, 后续可通过 users/show 补全
-        text: m.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        created_at: m.get("created_at").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        timestamp: 0, // DM 接口是字符串时间, 可后续解析
-        is_self: sid == my_uid,
-        msg_type: crate::domain::MsgType::from_api(type_val),
-        media_type: crate::domain::MediaType::from_api(media_val),
-        fids,
-    }
-}).collect();
+let fids = m.get("fids")
+    .and_then(|v| {
+        if let Some(arr) = v.as_array() {
+            Some(arr.iter()
+                .filter_map(|item| {
+                    item.as_u64().map(|n| n.to_string())
+                        .or_else(|| item.as_str().map(|s| s.to_string()))
+                })
+                .collect::<Vec<_>>())
+        } else if let Some(s) = v.as_str() {
+            Some(s.trim_matches(|c| c == '[' || c == ']')
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.trim().to_string())
+                .collect())
+        } else {
+            None
+        }
+    })
+    .unwrap_or_default();
 ```
 
-#### 1.2.3 新增 `format_timestamp` 辅助函数
+#### 3.2.2 优化图片占位渲染 — 确保可见性
 
-在 `chat_service.rs` 底部添加:
+**文件**: `src/view/widgets/message_bubble.rs` 第 115-135 行
 
+**当前**:
 ```rust
-/// 将 Unix 时间戳格式化为可读时间字符串。
-/// 今天的消息只显示 "HH:MM", 其他日期显示 "MM-DD HH:MM"。
-fn format_timestamp(ts: u64) -> String {
-    if ts == 0 { return String::new(); }
-    use std::time::{Duration, UNIX_EPOCH, SystemTime};
-    let msg_time = UNIX_EPOCH + Duration::from_secs(ts);
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    // 计算东八区偏移
-    let tz_offset: i64 = 8 * 3600;
-    let local_ts = ts as i64 + tz_offset;
-    let local_now = now as i64 + tz_offset;
-    let secs_in_day: i64 = 86400;
-    let msg_day = local_ts / secs_in_day;
-    let now_day = local_now / secs_in_day;
-    let hour = ((local_ts % secs_in_day) / 3600) as u32;
-    let minute = ((local_ts % 3600) / 60) as u32;
-    if msg_day == now_day {
-        format!("{:02}:{:02}", hour, minute)
-    } else if msg_day == now_day - 1 {
-        format!("昨天 {:02}:{:02}", hour, minute)
-    } else {
-        // 简易月/日计算 (近似)
-        let month_approx = ((local_ts % (365 * secs_in_day)) / (30 * secs_in_day)) + 1;
-        let day_approx = ((local_ts % (30 * secs_in_day)) / secs_in_day) + 1;
-        format!("{:02}-{:02} {:02}:{:02}", month_approx, day_approx, hour, minute)
-    }
-}
-```
-
-#### 1.2.4 修改 `send_dm_message` 和 `send_group_message` 返回值
-
-**`send_dm_message`** (第 359-366 行) 补全新字段:
-```rust
-return Some(crate::domain::ChatMessage {
-    id,
-    text,
-    created_at,
-    sender_id: my_uid,
-    sender_name: "我".to_string(),
-    sender_avatar: String::new(),
-    timestamp: std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
-    is_self: true,
-    msg_type: crate::domain::MsgType::Normal,
-    media_type: crate::domain::MediaType::Text,
-    fids: vec![],
-});
-```
-
-**`send_group_message`** (第 390-393 行) 同理:
-```rust
-return Some(crate::domain::ChatMessage {
-    id, text: text.to_string(), created_at: String::new(),
-    sender_id: String::new(), sender_name: "我".to_string(),
-    sender_avatar: String::new(),
-    timestamp: std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
-    is_self: true,
-    msg_type: crate::domain::MsgType::Normal,
-    media_type: crate::domain::MediaType::Text,
-    fids: vec![],
-});
-```
-
----
-
-### 1.3 `message_bubble.rs` — 重构消息气泡渲染
-
-**文件**: `src/view/widgets/message_bubble.rs`
-
-**改动说明**: 当前所有消息都渲染为相同的文本气泡。需要根据 `msg_type` 和 `media_type` 分别渲染:
-- 普通文本消息: 保持左右对齐气泡, 新增头像 + 时间戳
-- 系统消息 (入群/撤回): 居中灰色小字, 不显示气泡
-- 图片消息: 气泡内显示 `[图片]` 占位 (后续阶段加载真实缩略图)
-- 引用消息: 气泡内嵌灰色引用块
-
-**完整重写**:
-```rust
-//! Message bubble widget — renders a single chat message, supporting text/image/quote/system types.
-
-use gpui::*;
-use gpui::prelude::*;
-
-use crate::domain::{ChatMessage, MediaType, MsgType};
-use crate::view::theme;
-
-pub fn render(msg: &ChatMessage) -> impl IntoElement {
-    match &msg.msg_type {
-        MsgType::System | MsgType::Recall => render_system(msg),
-        _ => render_normal(msg),
-    }
-}
-
-/// 系统消息 / 撤回消息 — 居中灰色小字
-fn render_system(msg: &ChatMessage) -> AnyElement {
+fn render_image_bubble(msg: &ChatMessage, _bg: Rgba, fg: Rgba) -> AnyElement {
     div()
-        .flex().flex_row().w_full().justify_center().py_1()
-        .child(
-            div()
-                .px_3().py_1().rounded_full()
-                .bg(rgb(0x1a2a4a))
-                .text_size(px(11.0))
-                .text_color(rgb(theme::CLR_MUTED))
-                .child(msg.text.clone()),
-        )
-        .into_any_element()
-}
-
-/// 普通消息 (文本/图片/引用) — 气泡 + 头像 + 时间戳
-fn render_normal(msg: &ChatMessage) -> AnyElement {
-    let is_self = msg.is_self;
-    let bubble_color = if is_self { rgb(theme::CLR_ACCENT) } else { rgb(0x2a3a5a) };
-    let text_color = if is_self { rgb(0xffffff) } else { rgb(theme::CLR_TEXT) };
-
-    // 头像: 首字占位圆
-    let avatar_char = if is_self {
-        "我".to_string()
-    } else {
-        msg.sender_name.chars().next().map(|c| c.to_string()).unwrap_or_default()
-    };
-    let avatar = div()
-        .w(px(36.0)).h(px(36.0)).rounded_full()
-        .bg(if is_self { rgb(theme::CLR_ACCENT) } else { rgb(0x3a4a6a) })
-        .flex().items_center().justify_center()
-        .text_size(px(14.0)).text_color(rgb(0xffffff)).flex_shrink_0()
-        .child(avatar_char);
-
-    // 气泡内容
-    let bubble_content = match &msg.media_type {
-        MediaType::Image => render_image_bubble(msg, bubble_color, text_color),
-        MediaType::Quote => render_quote_bubble(msg, bubble_color, text_color),
-        _               => render_text_bubble(msg, bubble_color, text_color),
-    };
-
-    // 发送者名称 + 时间
-    let name_time = div()
-        .flex().flex_row().gap_2().px_1()
-        .text_size(px(11.0)).text_color(rgb(theme::CLR_MUTED))
-        .child(if is_self { "我".to_string() } else { msg.sender_name.clone() })
-        .child(msg.created_at.clone());
-
-    // 整行布局: 头像 + (名称 + 气泡), 自己的消息反向排列
-    let msg_body = div()
-        .flex().flex_col().gap_1()
-        .max_w(px(360.0))
-        .child(name_time)
-        .child(bubble_content);
-
-    div()
-        .flex().flex_row().w_full().px_3().py_1().gap_2()
-        .when(is_self, |d| d.flex_row_reverse())
-        .child(avatar)
-        .child(msg_body)
-        .into_any_element()
-}
-
-/// 纯文本气泡
-fn render_text_bubble(msg: &ChatMessage, bg: Hsla, fg: Hsla) -> AnyElement {
-    div()
-        .px_3().py_2().rounded_lg()
-        .bg(bg).text_size(px(13.0)).text_color(fg)
-        .child(msg.text.clone())
-        .into_any_element()
-}
-
-/// 图片消息气泡 — 显示 [图片] 占位 (第二阶段替换为真实缩略图加载)
-fn render_image_bubble(msg: &ChatMessage, bg: Hsla, fg: Hsla) -> AnyElement {
-    div()
-        .px_3().py_2().rounded_lg().bg(bg)
+        .px_3().py_2().rounded_lg().bg(_bg)
         .child(
             div().flex().flex_col().gap_1()
                 .child(
@@ -405,777 +354,297 @@ fn render_image_bubble(msg: &ChatMessage, bg: Hsla, fg: Hsla) -> AnyElement {
                         .text_size(px(24.0)).text_color(rgb(theme::CLR_MUTED))
                         .child("🖼")
                 )
-                .child(if !msg.text.is_empty() && msg.text != "分享图片" {
-                    div().text_size(px(13.0)).text_color(fg).child(msg.text.clone()).into_any_element()
-                } else {
-                    div().text_size(px(12.0)).text_color(rgb(theme::CLR_MUTED)).child("[图片]").into_any_element()
-                })
-        )
-        .into_any_element()
-}
+                ...
+```
 
-/// 引用消息气泡 — 解析 content 中「...」引用块
-fn render_quote_bubble(msg: &ChatMessage, bg: Hsla, fg: Hsla) -> AnyElement {
-    // 微博引用格式: 「引用文本」\n- - - - -\n回复文本
-    // 可能多层嵌套
-    let parts: Vec<&str> = msg.text.splitn(2, "\n- - - - - - - - - - - - - - -\n").collect();
-
-    let (quote_text, reply_text) = if parts.len() == 2 {
-        (parts[0].trim_matches('「').trim_matches('」').to_string(), parts[1].to_string())
+**改为**:
+```rust
+fn render_image_bubble(msg: &ChatMessage, _bg: Rgba, fg: Rgba) -> AnyElement {
+    // 构建图片描述文本
+    let desc = if msg.fids.is_empty() {
+        "[图片]".to_string()
     } else {
-        (String::new(), msg.text.clone())
+        format!("[图片 x{}]", msg.fids.len())
     };
 
     div()
-        .px_3().py_2().rounded_lg().bg(bg)
-        .child(
-            div().flex().flex_col().gap_2()
-                .when(!quote_text.is_empty(), |d| {
-                    let qt = quote_text.clone();
-                    d.child(
-                        div()
-                            .px_2().py_1().rounded_md()
-                            .bg(rgb(0x1a2a4a))
-                            .border_l_2().border_color(rgb(theme::CLR_MUTED))
-                            .text_size(px(12.0)).text_color(rgb(theme::CLR_MUTED))
-                            .child(qt)
-                    )
-                })
-                .child(div().text_size(px(13.0)).text_color(fg).child(reply_text))
-        )
-        .into_any_element()
-}
-```
-
----
-
-### 1.4 `chat_screen.rs` — 时间分组 + 自动滚到底部
-
-**文件**: `src/view/screens/chat_screen.rs`
-
-#### 1.4.1 消息列表使用 `ListAlignment::Bottom` 自动滚到底部
-
-**当前代码** (`chat_vm.rs` 第 85 行 和第 112 行):
-```rust
-chat.msg_list_state = Some(ListState::new(count, ListAlignment::Top, px(50.0)));
-```
-
-**改为**:
-```rust
-chat.msg_list_state = Some(ListState::new(count, ListAlignment::Bottom, px(50.0)));
-```
-
-涉及位置:
-- `select_contact()` 第 85 行
-- `load_more_messages()` 第 112 行 (此处保持 `Top`, 因为加载更早的消息应保持滚动位置)
-- `handle_ws_message()` (`root_vm.rs` 第 111 行)
-
-#### 1.4.2 消息列表中插入时间分割线
-
-**改动说明**: 在 `message_panel` 的 list 渲染回调中, 比较相邻消息的 `timestamp`, 如果间隔超过 5 分钟则在上方插入时间分割线。
-
-**方案**: 预处理消息列表, 构建一个 `Vec<ListItem>` 枚举:
-
-在 `chat_screen.rs` 顶部新增:
-```rust
-/// 消息列表中的项目类型: 真实消息 或 时间分割线
-#[derive(Clone)]
-enum ListItem {
-    Message(ChatMessage),
-    TimeSeparator(String), // 格式化的时间文本
-}
-
-/// 将消息列表转化为包含时间分割线的列表。
-/// 规则: 如果两条相邻消息的 timestamp 间隔 > 300 秒 (5分钟), 插入分割线。
-fn build_list_items(msgs: &[ChatMessage]) -> Vec<ListItem> {
-    let mut items = Vec::new();
-    for (i, msg) in msgs.iter().enumerate() {
-        if i == 0 || (msg.timestamp > 0 && msgs[i-1].timestamp > 0
-            && msg.timestamp.saturating_sub(msgs[i-1].timestamp) > 300)
-        {
-            if msg.timestamp > 0 {
-                items.push(ListItem::TimeSeparator(msg.created_at.clone()));
-            }
-        }
-        items.push(ListItem::Message(msg.clone()));
-    }
-    items
-}
-```
-
-在 `message_panel` 函数中, 将 `msgs_v` 替换为 `list_items`:
-```rust
-let list_items = build_list_items(&msgs_v);
-let item_count = list_items.len();
-```
-
-List 渲染回调中:
-```rust
-list((*lst).clone(), move |ix, _window, _cx| {
-    if ix >= list_items.len() { return div().into_any_element(); }
-    match &list_items[ix] {
-        ListItem::TimeSeparator(time_text) => {
-            div().flex().flex_row().justify_center().py_2()
-                .child(
-                    div().px_3().py_1().rounded_full()
-                        .bg(rgb(0x1a2a4a))
-                        .text_size(px(11.0)).text_color(rgb(theme::CLR_MUTED))
-                        .child(time_text.clone())
-                )
-                .into_any_element()
-        }
-        ListItem::Message(msg) => {
-            crate::view::widgets::message_bubble::render(msg).into_any_element()
-        }
-    }
-}).flex_1().into_any_element()
-```
-
-**注意**: `msg_list_state` 的 item count 需要改为 `item_count` (包含分割线), 需在 `chat_vm.rs` 中相应调整, 或者在渲染时动态计算。
-最简实现: 在 `chat_screen.rs` 的 `message_panel` 中, 每次渲染时用 `build_list_items` 重新计算 count, 如果与当前 `msg_list_state` 的 count 不一致, 则重建 `ListState`。
-
----
-
-### 1.5 `root_vm.rs` — WebSocket 推送消息补全新字段
-
-**文件**: `src/viewmodel/root_vm.rs`
-
-**当前代码** (`handle_ws_message`, 第 96-104 行):
-```rust
-let new_msg = ChatMessage {
-    id: String::new(),
-    sender_id,
-    sender_name,
-    text: text.clone(),
-    created_at: String::new(),
-    is_self,
-};
-```
-
-**改为**:
-```rust
-let new_msg = ChatMessage {
-    id: String::new(),
-    sender_id,
-    sender_name,
-    sender_avatar: msg.data.get("from_user")
-        .and_then(|u| u.get("profile_image_url"))
-        .and_then(|v| v.as_str()).unwrap_or("").to_string(),
-    text: text.clone(),
-    created_at: String::new(),
-    timestamp: std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-    is_self,
-    msg_type: crate::domain::MsgType::from_api(
-        msg.data.get("type").and_then(|v| v.as_u64()).unwrap_or(321)
-    ),
-    media_type: crate::domain::MediaType::from_api(
-        msg.data.get("media_type").and_then(|v| v.as_u64()).unwrap_or(0)
-    ),
-    fids: msg.data.get("fids")
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim_matches(|c| c == '[' || c == ']')
-            .split(',').filter(|s| !s.is_empty())
-            .map(|s| s.trim().to_string()).collect())
-        .unwrap_or_default(),
-};
-```
-
-#### 1.5.1 新消息自动滚到底部
-
-在 `handle_ws_message` 中追加消息后重建 `msg_list_state` 时使用 `ListAlignment::Bottom`:
-
-**当前** (第 111 行):
-```rust
-chat.msg_list_state = Some(ListState::new(chat.messages.len(), ListAlignment::Top, px(50.0)));
-```
-
-**改为**:
-```rust
-chat.msg_list_state = Some(ListState::new(chat.messages.len(), ListAlignment::Bottom, px(50.0)));
-```
-
----
-
-### 1.6 编译适配 — 所有构造 `ChatMessage` 的位置
-
-以下位置直接构造 `ChatMessage` 结构体, 需要补全新增字段:
-
-| 文件 | 函数 | 行号 | 说明 |
-|------|------|------|------|
-| `src/model/chat_service.rs` | `fetch_group_messages` | 198-209 | 1.2.1 已覆盖 |
-| `src/model/chat_service.rs` | `fetch_messages` | 260-282 | 1.2.2 已覆盖 |
-| `src/model/chat_service.rs` | `send_dm_message` | 359-366 | 1.2.4 已覆盖 |
-| `src/model/chat_service.rs` | `send_group_message` | 390-393 | 1.2.4 已覆盖 |
-| `src/viewmodel/root_vm.rs` | `handle_ws_message` | 96-104 | 1.5 已覆盖 |
-
----
-
-## 第二阶段：交互完善 (头像/表情/输入/已读)
-
-### 2.1 `contact_card.rs` — 加载真实头像
-
-**文件**: `src/view/widgets/contact_card.rs`
-
-**改动说明**: 当前头像是首字母占位圆, 需要加载 `Contact.avatar` 的真实图片。GPUI 支持通过 `img()` 元素 + `ImageSource::Uri` 加载网络图片。
-
-**当前代码** (第 16-21 行):
-```rust
-div()
-    .w(px(40.0)).h(px(40.0)).rounded_full()
-    .bg(rgb(theme::CLR_ACCENT))
-    .flex().items_center().justify_center()
-    .text_size(px(16.0)).text_color(rgb(0xffffff))
-    .child(if contact.is_group { "群".to_string() } else { contact.screen_name.chars().next()... }),
-```
-
-**改为**:
-```rust
-// 检查是否有可用头像 URL
-if !contact.avatar.is_empty() {
-    img(ImageSource::Uri(contact.avatar.clone().into()))
-        .w(px(40.0)).h(px(40.0)).rounded_full()
-        .bg(rgb(theme::CLR_ACCENT)) // fallback背景色
-        .into_any_element()
-} else {
-    // 无头像时使用首字占位
-    div()
-        .w(px(40.0)).h(px(40.0)).rounded_full()
-        .bg(rgb(theme::CLR_ACCENT))
-        .flex().items_center().justify_center()
-        .text_size(px(16.0)).text_color(rgb(0xffffff))
-        .child(if contact.is_group { "群".to_string() } else {
-            contact.screen_name.chars().next().map(|c| c.to_string()).unwrap_or_default()
-        })
-        .into_any_element()
-}
-```
-
-> **注意**: 需要确认 GPUI 0.2 版本是否支持 `ImageSource::Uri` 网络图片加载。如果不支持, 需要改为:
-> 1. 在 `chat_service.rs` 中异步下载头像图片为 bytes
-> 2. 将 bytes 存入 `Contact` 结构体
-> 3. 使用 `img(ImageSource::Render(...))` 或 `SharedUri` 渲染
-
-### 2.2 `message_bubble.rs` — 气泡中的头像也用同样方式
-
-在 `render_normal` 中将 avatar 占位替换为条件加载:
-```rust
-let avatar = if !msg.sender_avatar.is_empty() {
-    img(ImageSource::Uri(msg.sender_avatar.clone().into()))
-        .w(px(36.0)).h(px(36.0)).rounded_full()
-        .bg(rgb(0x3a4a6a))
-        .flex_shrink_0()
-        .into_any_element()
-} else {
-    div()
-        .w(px(36.0)).h(px(36.0)).rounded_full()
-        .bg(if is_self { rgb(theme::CLR_ACCENT) } else { rgb(0x3a4a6a) })
-        .flex().items_center().justify_center()
-        .text_size(px(14.0)).text_color(rgb(0xffffff)).flex_shrink_0()
-        .child(avatar_char)
-        .into_any_element()
-};
-```
-
-### 2.3 表情面板 — 新增 `emoji_panel` widget
-
-**新文件**: `src/view/widgets/emoji_panel.rs`
-
-**改动说明**: 
-- 在 `chat_service.rs` 新增 `fetch_emotions()` 函数调用 `GET /webim/emotions.json?source=209678993`
-- 解析返回的表情列表: `[{phrase: "[不愧是你]", url: "https://...png", ...}]`
-- 在 `ChatData` 中缓存表情列表
-- 新增 widget 渲染表情选择面板 (Grid 布局, 点击插入 `[表情名]` 到 draft_text)
-
-#### 2.3.1 Domain model 新增 `Emotion`
-
-在 `src/domain/mod.rs` 添加:
-```rust
-/// 微博表情
-#[derive(Clone, Debug)]
-pub struct Emotion {
-    /// 表情文本标记, 如 "[不愧是你]"
-    pub phrase: String,
-    /// 表情图片 URL
-    pub url: String,
-}
-```
-
-#### 2.3.2 `chat_service.rs` 新增 `fetch_emotions()`
-
-```rust
-/// 获取微博表情列表
-pub async fn fetch_emotions() -> Vec<crate::domain::Emotion> {
-    let (cookie, _xsrf) = chat_headers();
-    let url = format!("{}/webim/emotions.json?source={}", CHAT_BASE, SOURCE);
-
-    let client = http_client::build_no_store();
-    match client.get(&url)
-        .header("Cookie", &cookie)
-        .header("Referer", format!("{}/chat", CHAT_BASE))
-        .header("User-Agent", config::DEFAULT_UA)
-        .timeout(config::REQUEST_TIMEOUT)
-        .send().await
-    {
-        Ok(resp) => {
-            if let Ok(arr) = resp.json::<Vec<serde_json::Value>>().await {
-                return arr.iter().filter_map(|e| {
-                    let phrase = e.get("phrase")?.as_str()?.to_string();
-                    let url = e.get("url")?.as_str()?.to_string();
-                    Some(crate::domain::Emotion { phrase, url })
-                }).collect();
-            }
-        }
-        Err(e) => log_info!("[chat] 获取表情失败: {}", e),
-    }
-    Vec::new()
-}
-```
-
-#### 2.3.3 `ChatData` 新增字段
-
-在 `src/viewmodel/chat_vm.rs` 的 `ChatData` 中:
-```rust
-pub struct ChatData {
-    // ... 已有字段 ...
-    /// 表情列表 (懒加载缓存)
-    pub emotions: Vec<crate::domain::Emotion>,
-    /// 是否显示表情面板
-    pub show_emoji_panel: bool,
-}
-```
-
-#### 2.3.4 `emoji_panel.rs` widget
-
-```rust
-//! Emoji panel widget — grid of clickable emoji items.
-
-use gpui::*;
-use crate::domain::Emotion;
-use crate::view::theme;
-use crate::viewmodel::root_vm::AppRoot;
-
-pub fn render(emotions: &[Emotion], cx: &mut Context<AppRoot>) -> impl IntoElement {
-    let emotions_owned: Vec<Emotion> = emotions.to_vec();
-    let cols = 8; // 每行 8 个表情
-
-    div()
-        .flex().flex_col().w_full().max_h(px(200.0)).overflow_y_scroll()
-        .bg(rgb(0x0d1b36)).border_t_1().border_color(rgb(0x1a2a4a))
-        .px_2().py_2()
-        .children(
-            emotions_owned.chunks(cols).enumerate().map(|(row_idx, row)| {
-                let row_items: Vec<Emotion> = row.to_vec();
-                div().flex().flex_row().gap_1()
-                    .children(row_items.into_iter().enumerate().map(|(col_idx, em)| {
-                        let phrase = em.phrase.clone();
-                        let display = phrase.trim_matches(|c| c == '[' || c == ']').to_string();
-                        div()
-                            .id(("emoji", row_idx * cols + col_idx))
-                            .cursor_pointer()
-                            .px_1().py_1().rounded_md()
-                            .hover(|s| s.bg(rgb(0x1a2a4a)))
-                            .text_size(px(12.0)).text_color(rgb(theme::CLR_TEXT))
-                            .child(display)
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                                if let Some(chat) = this.chat_data.as_mut() {
-                                    chat.draft_text.push_str(&phrase);
-                                    chat.show_emoji_panel = false;
-                                }
-                                cx.notify();
-                            }))
-                    }))
-            })
-        )
-}
-```
-
-#### 2.3.5 注册 widget module
-
-`src/view/widgets/mod.rs` 添加:
-```rust
-pub mod emoji_panel;
-```
-
-#### 2.3.6 `input_bar` 添加表情按钮
-
-在 `chat_screen.rs` 的 `input_bar` 函数中, 在发送按钮前添加表情按钮:
-```rust
-// 表情按钮
-.child(
-    div().id("emoji-btn").cursor_pointer()
-        .px_2().py_2().rounded_lg()
-        .text_size(px(18.0))
-        .hover(|s| s.bg(rgb(0x1a2a4a)))
-        .child("😊")
-        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-            if let Some(chat) = this.chat_data.as_mut() {
-                chat.show_emoji_panel = !chat.show_emoji_panel;
-                // 首次打开时加载表情列表
-                if chat.show_emoji_panel && chat.emotions.is_empty() {
-                    // 异步加载 emotions
-                    crate::viewmodel::chat_vm::load_emotions(cx, &this.tokio_handle);
-                }
-            }
-            cx.notify();
-        }))
-)
-```
-
-在 `message_panel` 中, input_bar 上方条件渲染表情面板:
-```rust
-// 表情面板 (输入栏上方, 消息区域下方)
-.child(if show_emoji_panel {
-    let emotions = chat_emotions.clone();
-    crate::view::widgets::emoji_panel::render(&emotions, cx).into_any_element()
-} else {
-    div().into_any_element()
-})
-.child(input_bar(&uid, is_group, draft, cx))
-```
-
-### 2.4 `chat_service.rs` — 已读上报
-
-**新增函数**: `report_read()`
-
-根据 HAR 中 `POST /webim/report.json` 的结构:
-```rust
-/// 上报已读状态 (进入/切换会话时调用)
-pub async fn report_read(uid: &str) {
-    let (cookie, xsrf) = chat_headers();
-    let url = format!("{}/webim/report.json", CHAT_BASE);
-    let client = http_client::build_no_store();
-
-    let data_json = serde_json::json!({
-        "type": 2,
-        "uid": uid,
-    });
-    let params = format!("data={}&source={}", 
-        url::form_urlencoded::byte_serialize(data_json.to_string().as_bytes()).collect::<String>(),
-        SOURCE
-    );
-
-    match client.post(&url)
-        .header("Cookie", &cookie)
-        .header("Referer", format!("{}/chat", CHAT_BASE))
-        .header("User-Agent", config::DEFAULT_UA)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("X-XSRF-TOKEN", &xsrf)
-        .body(params)
-        .timeout(config::REQUEST_TIMEOUT)
-        .send().await
-    {
-        Ok(_) => log_info!("[chat] 已读上报: uid={}", uid),
-        Err(e) => log_info!("[chat] 已读上报失败: {}", e),
-    }
-}
-```
-
-在 `chat_vm::select_contact()` 中, 加载消息成功后调用:
-```rust
-// 在 this.update 闭包内, messages 赋值后:
-let uid_report = uid.clone();
-let handle_report = handle.clone();
-tokio::spawn(async move {
-    chat_service::report_read(&uid_report).await;
-});
-```
-
-### 2.5 `input_bar` — 改进输入体验
-
-**文件**: `src/view/screens/chat_screen.rs`
-
-**改动说明**: 当前 `input_bar` 使用 `on_key_down` 逐字拦截, 不支持中文输入法(IME)。需要改为使用 GPUI 的 `InputEditor` 或更精细的 `on_input` 事件处理。
-
-**当前 input_bar 问题**:
-1. `on_key_down` 无法正确处理 IME 组合输入
-2. 不支持 Shift+Enter 换行
-3. 不支持 Ctrl+A/C/V 等快捷键
-
-**改造方案** — 使用 `on_input` + `on_key_down` 配合:
-```rust
-fn input_bar(uid: &str, is_group: bool, draft: &str, cx: &mut Context<AppRoot>) -> impl IntoElement {
-    let u1 = uid.to_string();
-    let u2 = uid.to_string();
-    let d = draft.to_string();
-
-    div().flex().flex_row().items_center().gap_2()
-        .px_3().py_2().bg(rgb(0x0d1b36)).border_t_1().border_color(rgb(0x1a2a4a))
-        // 表情按钮 (2.3.6)
-        .child(/* emoji button */)
-        .child(
-            div().id("msg-input").flex_1()
-                .px_3().py_2().rounded_lg().bg(rgb(0x1a2a4a))
-                .text_size(px(13.0)).text_color(rgb(theme::CLR_TEXT))
-                .focusable()
-                .on_input(cx.listener(move |this, ev: &InputEvent, _window, cx| {
-                    // IME 友好: on_input 在 IME 确认后触发
-                    if let Some(chat) = this.chat_data.as_mut() {
-                        chat.draft_text.push_str(&ev.text);
-                    }
-                    cx.notify();
-                }))
-                .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, _window, cx| {
-                    let Some(chat) = this.chat_data.as_mut() else { return };
-                    match ev.keystroke.key.as_str() {
-                        "enter" | "return" if !ev.keystroke.modifiers.shift => {
-                            // 普通 Enter 发送
-                            let text = chat.draft_text.trim().to_string();
-                            if !text.is_empty() {
-                                chat.draft_text.clear();
-                                chat_vm::send_message(cx, &this.tokio_handle, u1.clone(), text, is_group);
-                            }
-                        }
-                        "enter" | "return" if ev.keystroke.modifiers.shift => {
-                            // Shift+Enter 换行
-                            chat.draft_text.push('\n');
-                        }
-                        "backspace" => { chat.draft_text.pop(); }
-                        _ => {} // 其他字符由 on_input 处理
-                    }
-                    cx.notify();
-                }))
-                .child(if d.is_empty() {
-                    div().text_color(rgb(theme::CLR_MUTED)).child("输入消息, Enter发送, Shift+Enter换行").into_any_element()
-                } else {
-                    div().text_color(rgb(theme::CLR_TEXT)).child(format!("{}", d)).into_any_element()
-                }),
-        )
-        .child(/* send button */)
-}
-```
-
-> **注意**: 需要确认 GPUI 0.2 是否有 `on_input` / `InputEvent`。如果不支持, 备选方案是使用 GPUI 的 `TextInput` 组件或保持当前方式, 在 `on_key_down` 中过滤掉 IME 前置键。
-
----
-
-## 第三阶段：功能增强 (群聊/搜索/图片加载)
-
-### 3.1 群成员侧栏
-
-**新增 API**: `chat_service::fetch_group_info()`
-```rust
-/// 获取群详情 (成员列表/群名/管理员等)
-/// API: GET /webim/query_group.json?is_pc=1&query_member=1&sort_by_jp=1&query_member_count=5000&id={gid}&source=209678993
-pub async fn fetch_group_info(gid: &str) -> Option<GroupInfo> { ... }
-```
-
-**新增 Domain model**:
-```rust
-#[derive(Clone, Debug)]
-pub struct GroupInfo {
-    pub id: String,
-    pub name: String,
-    pub owner_uid: String,
-    pub member_count: u64,
-    pub members: Vec<GroupMember>,
-}
-
-#[derive(Clone, Debug)]
-pub struct GroupMember {
-    pub uid: String,
-    pub screen_name: String,
-    pub avatar: String,
-    pub is_admin: bool,
-}
-```
-
-**新增 widget**: `src/view/widgets/member_sidebar.rs`
-- 右侧面板, 宽 180px
-- 成员列表: 头像 + 昵称, 管理员标识
-- 顶部显示群名和成员数
-
-**`chat_screen.rs` 布局调整**:
-```rust
-// message_panel 最外层
-div().flex().flex_row().flex_1().h_full()
-    .child(/* 消息区域 flex_1 */)
-    .child(if is_group { member_sidebar(...).into_any_element() } else { div().into_any_element() })
-```
-
-### 3.2 会话搜索
-
-**`ChatData` 新增**:
-```rust
-pub search_text: String,
-pub filtered_contacts: Vec<Contact>, // 搜索过滤后的联系人
-```
-
-**`chat_screen.rs` 联系人列表顶部新增搜索框**:
-```rust
-// contact_list 函数中, "会话 (N)" 标题下方
-.child(
-    div().px_2().py_1()
-        .child(
-            div().id("search-input").w_full().px_2().py_1()
-                .rounded_md().bg(rgb(0x1a2a4a))
-                .text_size(px(12.0)).text_color(rgb(theme::CLR_TEXT))
-                .focusable()
-                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
-                    if let Some(chat) = this.chat_data.as_mut() {
-                        let ch = ev.keystroke.key_char.as_deref().unwrap_or("");
-                        match ev.keystroke.key.as_str() {
-                            "backspace" => { chat.search_text.pop(); }
-                            _ if !ch.is_empty() => { chat.search_text.push_str(ch); }
-                            _ => {}
-                        }
-                        // 过滤联系人
-                        chat.filtered_contacts = chat.contacts.iter()
-                            .filter(|c| c.screen_name.contains(&chat.search_text) || chat.search_text.is_empty())
-                            .cloned().collect();
-                    }
-                    cx.notify();
-                }))
-                .child(if search_text.is_empty() {
-                    div().text_color(rgb(theme::CLR_MUTED)).child("🔍 搜索")
-                } else {
-                    div().child(search_text.clone())
-                })
-        )
-)
-```
-
-### 3.3 图片消息真实渲染
-
-**改动说明**: 第一阶段的图片消息只显示占位符。本阶段加载真实图片缩略图。
-
-**缩略图 URL 拼接规则** (来自 HAR):
-```
-https://upload.api.weibo.com/2/mss/msget_thumbnail?fid={fid}&high=240&width=240&size=240,240&source=209678993
-```
-群聊图片额外需要 `gid` 参数:
-```
-https://upload.api.weibo.com/2/mss/msget_thumbnail?fid={fid}&high=240&width=240&gid={gid}&size=240,240&source=209678993
-```
-
-**`message_bubble.rs` 中 `render_image_bubble` 改为**:
-```rust
-fn render_image_bubble(msg: &ChatMessage, bg: Hsla, fg: Hsla) -> AnyElement {
-    let image_elements: Vec<AnyElement> = msg.fids.iter().map(|fid| {
-        let thumb_url = format!(
-            "https://upload.api.weibo.com/2/mss/msget_thumbnail?fid={}&high=240&width=240&size=240,240&source=209678993",
-            fid
-        );
-        img(ImageSource::Uri(thumb_url.into()))
-            .w(px(200.0)).h(px(150.0))
-            .rounded_md()
-            .bg(rgb(0x2a3a5a)) // 加载中的背景色
-            .into_any_element()
-    }).collect();
-
-    div()
-        .px_3().py_2().rounded_lg().bg(bg)
+        .px_3().py_2().rounded_lg().bg(_bg)
         .child(
             div().flex().flex_col().gap_1()
-                .children(image_elements)
-                .child(if !msg.text.is_empty() && msg.text != "分享图片" {
-                    div().text_size(px(13.0)).text_color(fg).child(msg.text.clone()).into_any_element()
-                } else {
-                    div().into_any_element()
+                .child(
+                    div()
+                        .w(px(180.0))        // 稍微缩小避免撑破 max_w
+                        .h(px(100.0))
+                        .rounded_md()
+                        .bg(rgb(0x1e2e4e))   // 更深的背景色以便区分
+                        .border_1()
+                        .border_color(rgb(0x2a3a5a))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap_1()
+                        .child(
+                            div().text_size(px(28.0)).child("🖼")
+                        )
+                        .child(
+                            div().text_size(px(11.0))
+                                .text_color(rgb(theme::CLR_MUTED))
+                                .child(desc)
+                        )
+                )
+                // 如果有附带文字且不是默认的"分享图片"，则显示
+                .when(!msg.text.is_empty() && msg.text != "分享图片", |d| {
+                    let t = msg.text.clone();
+                    d.child(
+                        div().text_size(px(13.0)).text_color(fg).child(t)
+                    )
                 })
         )
         .into_any_element()
 }
 ```
 
-> **Cookie 问题**: 图片 URL 需要 Cookie 鉴权。GPUI 的 `img()` 可能不支持自定义 Header。
-> 备选方案: 在 `chat_service.rs` 中预下载图片 bytes, 将 `Vec<u8>` 传给渲染层。
+**关键改动**:
+- 缩小图片占位尺寸 (180x100)，避免超出 `max_w(360px)` 气泡宽度
+- 添加 `border_1()` 边框使占位区域清晰可见
+- 显示图片数量信息 `[图片 x1]`
+- 使用 `.when()` 条件渲染文字，避免不必要的空 div
 
-### 3.4 新消息提示音
+---
 
-**新文件**: `src/infra/audio.rs`
+## 修复四: 滚轮无法触发加载更多消息
+
+### 4.1 问题分析
+
+当前"加载更早消息"功能仅有一个手动点击按钮 (`load-more-btn`)，没有滚轮滚动到顶部自动加载的逻辑。用户需要不断点击按钮，体验差。
+
+**根因**: `msg_list_state` 没有设置 `set_scroll_handler`，无法检测滚动到顶部的事件。
+
+### 4.2 修复方案
+
+#### 4.2.1 在 `chat_screen.rs` 的消息列表上设置 scroll handler
+
+**文件**: `src/view/screens/chat_screen.rs`
+
+在 `message_panel` 函数中，创建 list 之前，给 `msg_list_state` 设置 scroll handler:
+
+**在第 306 行 `.child(if !msgs.is_empty() {` 之前插入**:
 
 ```rust
-//! Simple audio playback for new message notification.
+// 设置滚动监听: 滚到顶部时自动加载更多
+if has_more {
+    if let Some(ref lst) = msg_list_state {
+        let uid_scroll = uid.clone();
+        let muid_scroll = my_uid.clone();
+        let mid_scroll = oldest_mid.clone().unwrap_or_default();
+        lst.set_scroll_handler(cx.listener(
+            move |this, event: &ListScrollEvent, _window, cx| {
+                // 当可见区域的起始索引 <= 2 时 (接近顶部), 自动加载更早消息
+                if event.visible_range.start <= 2 {
+                    if let Some(chat) = this.chat_data.as_ref() {
+                        if chat.has_more && !chat.messages_loading {
+                            if let Some(chat_mut) = this.chat_data.as_mut() {
+                                chat_mut.messages_loading = true;
+                            }
+                            chat_vm::load_more_messages(
+                                cx,
+                                &this.tokio_handle,
+                                uid_scroll.clone(),
+                                muid_scroll.clone(),
+                                is_group,
+                                mid_scroll.clone(),
+                            );
+                        }
+                    }
+                }
+            }
+        ));
+    }
+}
+```
 
-use std::io::Cursor;
+#### 4.2.2 使用 `messages_loading` 防止重复触发
 
-/// 播放新消息提示音 (chat.mp3 内嵌资源)
-pub fn play_notification() {
-    // 使用 rodio crate 播放音频
-    std::thread::spawn(|| {
-        // 内嵌的提示音 bytes (编译时 include_bytes! 或运行时下载)
-        let audio_data = include_bytes!("../../assets/chat.mp3");
-        // 需要 rodio 依赖
-        if let Ok((_stream, stream_handle)) = rodio::OutputStream::try_default() {
-            if let Ok(source) = rodio::Decoder::new(Cursor::new(audio_data)) {
-                let _ = stream_handle.play_raw(source.convert_samples());
-                std::thread::sleep(std::time::Duration::from_secs(2));
+`ChatData` 中已有 `messages_loading: bool` 字段。需确保在加载完成后重置:
+
+**文件**: `src/viewmodel/chat_vm.rs` `load_more_messages` 函数 (第 130-149 行)
+
+**在 `this.update(...)` 闭包内，添加重置**:
+
+**当前** (约第 131 行):
+```rust
+this.update(&mut cx, |v, cx| {
+    if let Some(chat) = v.chat_data.as_mut() {
+        let count = older.len();
+        if count > 0 {
+            ...
+        } else {
+            chat.has_more = false;
+        }
+    }
+    cx.notify();
+}).ok();
+```
+
+**改为**:
+```rust
+this.update(&mut cx, |v, cx| {
+    if let Some(chat) = v.chat_data.as_mut() {
+        chat.messages_loading = false;  // ← 新增: 重置加载状态
+        let count = older.len();
+        if count > 0 {
+            chat.oldest_mid = older.first().map(|m| m.id.clone());
+            chat.has_more = count >= 30;
+            let mut all = older;
+            all.append(&mut chat.messages);
+            chat.messages = all;
+            chat.msg_list_state = Some(rebuild_msg_list_state(&chat.messages, ListAlignment::Top));
+            log_info!("[chat_vm] 加载更早 {} 条消息, 总计 {} 条, has_more={}", count, chat.messages.len(), chat.has_more);
+        } else {
+            chat.has_more = false;
+            log_info!("[chat_vm] 没有更早的消息了");
+        }
+    }
+    cx.notify();
+}).ok();
+```
+
+#### 4.2.3 scroll handler 中的 `oldest_mid` 需要动态获取
+
+**问题**: 上面 4.2.1 中 `mid_scroll` 在闭包创建时就被捕获了，但 `oldest_mid` 在加载更多消息后会更新。闭包中使用的是旧值。
+
+**修复**: 在 scroll handler 内部从 `this.chat_data` 实时读取 `oldest_mid`:
+
+```rust
+lst.set_scroll_handler(cx.listener(
+    move |this, event: &ListScrollEvent, _window, cx| {
+        if event.visible_range.start <= 2 {
+            if let Some(chat) = this.chat_data.as_ref() {
+                if chat.has_more && !chat.messages_loading {
+                    if let Some(mid) = chat.oldest_mid.clone() {
+                        let uid_s = chat.selected_uid.clone().unwrap_or_default();
+                        let muid_s = chat.my_uid.clone();
+                        let is_group_s = is_group;
+                        // 标记加载中
+                        if let Some(chat_mut) = this.chat_data.as_mut() {
+                            chat_mut.messages_loading = true;
+                        }
+                        chat_vm::load_more_messages(
+                            cx, &this.tokio_handle,
+                            uid_s, muid_s, is_group_s, mid,
+                        );
+                    }
+                }
             }
         }
-    });
-}
+    }
+));
 ```
 
-**Cargo.toml 新增**:
-```toml
-rodio = "0.19"
-```
+> **注意**: `cx.listener` 闭包的第一个参数 `this` 是 `&mut AppRoot`，可以直接访问最新的 `chat_data`。不需要提前捕获 `uid`/`oldest_mid`。
 
-**调用位置**: `root_vm.rs` 的 `handle_ws_message`, 收到非自己的消息时:
+#### 4.2.4 保留手动按钮作为备选
+
+保留现有的 "▲ 加载更早消息" 按钮不变，作为滚轮触发失败时的手动备选。但可以将文案改为更友好的提示:
+
 ```rust
-if !is_self {
-    crate::infra::audio::play_notification();
-}
-```
-
-### 3.5 消息角色标识 (群主/管理员)
-
-**Domain model** `ChatMessage` 新增:
-```rust
-/// 消息发送者在群中的角色 (0=普通, 1=管理员, 4=群主)
-pub role: u8,
-```
-
-**`message_bubble.rs` 渲染** — `name_time` 区域追加角色标签:
-```rust
-let role_badge = match msg.role {
-    4 => Some(("群主", 0xe8633a)),  // 橙色
-    1 => Some(("管理员", 0x4a9eff)), // 蓝色
-    _ => None,
-};
-
-let name_time = div()
-    .flex().flex_row().gap_2().px_1()
-    .text_size(px(11.0)).text_color(rgb(theme::CLR_MUTED))
-    .child(if is_self { "我".to_string() } else { msg.sender_name.clone() })
-    .when_some(role_badge, |d, (label, color)| {
-        d.child(
-            div().px_1().rounded_sm()
-                .bg(rgb(color))
-                .text_size(px(10.0)).text_color(rgb(0xffffff))
-                .child(label)
-        )
-    })
-    .child(msg.created_at.clone());
+.child("▲ 滚动到顶部自动加载 / 点击加载更早消息")
 ```
 
 ---
 
-## 改造文件清单
+## 附加修复: 防止 review.md 中的 P0 panic
 
-| 文件 | 阶段 | 改动类型 |
-|------|------|---------|
-| `src/domain/mod.rs` | 1 | 修改: 新增 `MsgType`/`MediaType` 枚举, 扩展 `ChatMessage` |
-| `src/model/chat_service.rs` | 1+2 | 修改: 解析新字段, 新增 `format_timestamp`/`fetch_emotions`/`report_read` |
-| `src/view/widgets/message_bubble.rs` | 1 | 重写: 支持文本/图片/引用/系统消息渲染 |
-| `src/view/screens/chat_screen.rs` | 1+2 | 修改: 时间分割线, 表情面板, 输入改进 |
-| `src/viewmodel/chat_vm.rs` | 1+2 | 修改: `ListAlignment::Bottom`, 新增 `emotions`/`show_emoji_panel` 字段 |
-| `src/viewmodel/root_vm.rs` | 1 | 修改: WS 消息补全字段 |
-| `src/view/widgets/contact_card.rs` | 2 | 修改: 真实头像加载 |
-| `src/view/widgets/emoji_panel.rs` | 2 | **新增**: 表情选择面板 |
-| `src/view/widgets/member_sidebar.rs` | 3 | **新增**: 群成员侧栏 |
-| `src/view/widgets/mod.rs` | 2+3 | 修改: 注册新 widget |
-| `src/infra/audio.rs` | 3 | **新增**: 提示音播放 |
-| `src/infra/mod.rs` | 3 | 修改: 注册 audio 模块 |
-| `Cargo.toml` | 3 | 修改: 新增 `rodio` 依赖 |
+以下是 `review.md` 中标记为 P0 的 panic 问题，应与上述 4 个修复一并处理:
+
+### A. 中文字符串切片 panic
+
+**文件**: `src/model/chat_service.rs` 第 375 行和第 438 行
+
+**当前**:
+```rust
+&text[..text.len().min(20)]
+```
+
+**改为**:
+```rust
+&text.chars().take(20).collect::<String>()
+```
+
+**或者使用辅助函数** (在 `chat_service.rs` 底部添加):
+```rust
+/// 安全截取字符串前 N 个字符 (UTF-8 安全)
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
+}
+```
+
+然后替换:
+```rust
+log_info!("[chat] 发送消息: uid={}, text={}...", uid, truncate_chars(text, 20));
+log_info!("[chat] Group send: gid={}, text={}...", gid, truncate_chars(text, 20));
+```
+
+### B. tokio::spawn 在非 runtime 上下文中的 panic
+
+**文件**: `src/view/screens/chat_screen.rs` 第 381 行
+
+**当前**:
+```rust
+tokio::spawn(async move { ... });
+```
+
+**改为** (使用 `cx.spawn` + `handle.block_on` 正确模式):
+```rust
+// 在 on_click listener 中, 将加载表情改为 cx.spawn 模式
+let handle = this.tokio_handle.clone();
+cx.spawn(|this_weak: WeakEntity<AppRoot>, cx: &mut AsyncApp| {
+    let mut cx = cx.clone();
+    async move {
+        let emotions = handle.block_on(
+            crate::model::chat_service::fetch_emotions()
+        );
+        this_weak.update(&mut cx, |v, cx| {
+            if let Some(chat) = v.chat_data.as_mut() {
+                chat.emotions = emotions;
+            }
+            cx.notify();
+        }).ok();
+    }
+}).detach();
+```
+
+**文件**: `src/viewmodel/chat_vm.rs` 第 108 行和第 115 行
+
+**当前**:
+```rust
+tokio::spawn(async move { ... });
+```
+
+**改为**:
+```rust
+handle.spawn(async move { ... });
+```
 
 ---
 
-## 风险 & 待确认项
+## 修改文件汇总
 
-1. **GPUI `img()` 网络图片**: 需确认 `gpui 0.2` 是否支持 `ImageSource::Uri` 加载远程图片, 以及是否能自定义 HTTP Header (Cookie 鉴权)。如不支持, 需改为手动下载 + `ImageSource::from_data(bytes)` 方案。
-2. **GPUI `on_input` / `InputEvent`**: 需确认是否有 IME 友好的输入事件。如不存在, 保持当前 `on_key_down` 方案, 暂不支持中文 IME。
-3. **时间格式化精度**: `format_timestamp` 使用简化月/日计算, 非闰年安全。可考虑引入 `chrono` crate 做精确格式化。
-4. **图片加载性能**: 群聊可能有大量图片消息, 需要考虑虚拟列表中的懒加载策略, 避免同时发起过多 HTTP 请求。
-5. **`rodio` 跨平台**: 音频库在 Linux/macOS/Windows 上的可用性需验证, 可能需要 ALSA/PulseAudio 等系统依赖。
+| 文件 | 修复内容 |
+|------|---------|
+| `src/view/widgets/contact_card.rs` | 修复一: 未读角标固定最小尺寸 + 居中 |
+| `src/viewmodel/chat_vm.rs` | 修复二: 新增 `compute_list_item_count` + `rebuild_msg_list_state`，修改 `select_contact`/`load_more_messages`/`send_message` |
+| `src/viewmodel/root_vm.rs` | 修复二: `handle_ws_message` 使用 `rebuild_msg_list_state` |
+| `src/view/screens/chat_screen.rs` | 修复二(防御校验) + 修复四(scroll handler) + 附加B(tokio::spawn) |
+| `src/model/chat_service.rs` | 修复三(fids 解析) + 附加A(中文切片) |
+| `src/view/widgets/message_bubble.rs` | 修复三: 优化图片占位渲染 |
+
+---
+
+## 验证方法
+
+1. **角标修复**: 打开聊天界面，确认未读数为 1-3 位数时角标保持圆形/短胶囊，不再被拉长
+2. **消息覆盖**: 进入有大量消息的群聊，确认消息之间不再重叠，滚动流畅
+3. **图片渲染**: 进入有图片消息的聊天，确认显示 "🖼 [图片 x1]" 占位，不再是空白块
+4. **滚轮加载**: 在消息列表中向上滚动到顶部，确认自动触发加载更早消息（观察日志 `[chat_vm] 加载更早`）

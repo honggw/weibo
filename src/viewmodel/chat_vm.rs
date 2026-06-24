@@ -71,9 +71,13 @@ pub fn count_list_items(msgs: &[ChatMessage]) -> usize {
 
 /// 创建全新的 msg_list_state（切换会话、批量加载时使用）。
 /// 当消息列表整体替换时，旧的 item 高度缓存不再有效，必须从头测量。
+/// 使用 measure_all() 确保所有 item 在第一次布局时被完整测量高度，
+/// 避免 ListAlignment::Bottom 模式下因未测量 item (height=0) 导致的布局重叠。
 pub fn rebuild_msg_list_state(chat: &mut ChatData, alignment: ListAlignment) {
     let new_count = count_list_items(&chat.messages);
-    chat.msg_list_state = Some(ListState::new(new_count, alignment, px(400.0)));
+    chat.msg_list_state = Some(
+        ListState::new(new_count, alignment, px(400.0)).measure_all()
+    );
 }
 
 /// 增量更新 msg_list_state 的 item_count（追加/接收单条消息时使用）。
@@ -87,7 +91,9 @@ pub fn update_msg_list_state_append(chat: &mut ChatData) {
             lst.splice(old_count..old_count, new_count - old_count);
         }
     } else {
-        chat.msg_list_state = Some(ListState::new(new_count, ListAlignment::Bottom, px(400.0)));
+        chat.msg_list_state = Some(
+            ListState::new(new_count, ListAlignment::Bottom, px(400.0)).measure_all()
+        );
     }
 }
 
@@ -99,7 +105,9 @@ pub fn update_msg_list_state_prepend(chat: &mut ChatData, prepended_item_count: 
         lst.splice(0..0, prepended_item_count);
     } else {
         let new_count = count_list_items(&chat.messages);
-        chat.msg_list_state = Some(ListState::new(new_count, ListAlignment::Bottom, px(400.0)));
+        chat.msg_list_state = Some(
+            ListState::new(new_count, ListAlignment::Bottom, px(400.0)).measure_all()
+        );
     }
 }
 

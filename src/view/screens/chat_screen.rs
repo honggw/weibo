@@ -347,7 +347,6 @@ fn message_panel(
                     }
                     match &items_for_list[ix] {
                         ListItem::TimeSeparator(time_text) => div()
-                            .overflow_hidden()
                             .flex().flex_row().justify_center().py_2()
                             .child(
                                 div()
@@ -359,9 +358,7 @@ fn message_panel(
                             )
                             .into_any_element(),
                         ListItem::Message(msg) => {
-                            div()
-                                .overflow_hidden()
-                                .child(crate::view::widgets::message_bubble::render(msg))
+                            crate::view::widgets::message_bubble::render(msg)
                                 .into_any_element()
                         }
                     }

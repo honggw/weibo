@@ -2,7 +2,7 @@
 
 use gpui::*;
 
-use crate::domain::{ChatMessage, Contact};
+use crate::domain::{ChatMessage, Contact, GroupInfo};
 use crate::view::theme;
 use crate::viewmodel::chat_vm::{self, ChatData};
 use crate::viewmodel::root_vm::AppRoot;
@@ -54,6 +54,14 @@ pub fn render(
         .unwrap_or_default();
     let loading = chat.map(|c| c.loading).unwrap_or(true);
     let count = filtered.len();
+    let full_count = contacts.len();
+    // When search filtering is active, use a ListState with the correct filtered count
+    // to prevent blank space in the list.
+    let effective_contact_list = if count != full_count {
+        ListState::new(count, ListAlignment::Top, px(60.0))
+    } else {
+        contact_list_state.clone()
+    };
     if loading && contacts.is_empty() {
         return div()
             .flex().flex_col().size_full().items_center().justify_center().gap_3()
@@ -89,6 +97,7 @@ pub fn render(
     let show_emoji_panel = chat.map(|c| c.show_emoji_panel).unwrap_or(false);
     let emotions = chat.map(|c| c.emotions.clone()).unwrap_or_default();
     let search_text = chat.map(|c| c.search_text.clone()).unwrap_or_default();
+    let group_info = chat.and_then(|c| c.group_info.clone());
 
     div()
         .flex().flex_row().size_full()
@@ -96,7 +105,7 @@ pub fn render(
             &filtered,
             count,
             &sel_uid,
-            contact_list_state,
+            &effective_contact_list,
             &search_text,
             cx,
         ))
@@ -112,6 +121,7 @@ pub fn render(
             msg_list_state,
             show_emoji_panel,
             &emotions,
+            group_info.as_ref(),
             cx,
         ))
         .into_any_element()
@@ -230,6 +240,7 @@ fn message_panel(
     has_more: bool, oldest_mid: Option<String>, is_group: bool, my_uid: String,
     draft: &str, msg_list_state: Option<ListState>,
     show_emoji_panel: bool, emotions: &[crate::domain::Emotion],
+    group_info: Option<&GroupInfo>,
     cx: &mut Context<AppRoot>,
 ) -> impl IntoElement {
     if sel_uid.is_none() {
@@ -250,7 +261,8 @@ fn message_panel(
     // Build list items with time separators
     let list_items = build_list_items(msgs);
 
-    div()
+    // Main content area
+    let main_content = div()
         .flex().flex_col().flex_1().h_full()
         // Header
         .child(
@@ -293,12 +305,6 @@ fn message_panel(
                         )),
                 )
                 .into_any_element()
-        } else {
-            div().into_any_element()
-        })
-        // Emoji panel (above input bar)
-        .child(if show_emoji_panel {
-            crate::view::widgets::emoji_panel::render(emotions, cx).into_any_element()
         } else {
             div().into_any_element()
         })
@@ -345,8 +351,28 @@ fn message_panel(
                 )
                 .into_any_element()
         })
+        // Emoji panel (between message list and input bar)
+        .child(if show_emoji_panel {
+            crate::view::widgets::emoji_panel::render(emotions, cx).into_any_element()
+        } else {
+            div().into_any_element()
+        })
         // Input bar
-        .child(input_bar(&uid, is_group, draft, cx))
+        .child(input_bar(&uid, is_group, draft, cx));
+
+    // Wrap main content with member sidebar on the right for group chats
+    div()
+        .flex().flex_row().flex_1().h_full()
+        .child(main_content)
+        .child(if is_group {
+            if let Some(info) = group_info {
+                crate::view::widgets::member_sidebar::render(info).into_any_element()
+            } else {
+                div().into_any_element()
+            }
+        } else {
+            div().into_any_element()
+        })
 }
 
 fn input_bar(
@@ -378,14 +404,20 @@ fn input_bar(
                             // 首次打开时加载表情列表
                             if chat.show_emoji_panel && chat.emotions.is_empty() {
                                 let handle = this.tokio_handle.clone();
-                                tokio::spawn(async move {
-                                    let emotions =
-                                        crate::model::chat_service::fetch_emotions().await;
-                                    // Note: can't easily update chat_data from raw tokio spawn
-                                    // The emotions will be loaded next time panel opens
-                                    let _ = emotions;
-                                    let _ = handle;
-                                });
+                                cx.spawn(|this: WeakEntity<AppRoot>, cx: &mut AsyncApp| {
+                                    let mut cx = cx.clone();
+                                    async move {
+                                        let emotions = handle.block_on(
+                                            crate::model::chat_service::fetch_emotions()
+                                        );
+                                        this.update(&mut cx, |v, cx| {
+                                            if let Some(chat) = v.chat_data.as_mut() {
+                                                chat.emotions = emotions;
+                                            }
+                                            cx.notify();
+                                        }).ok();
+                                    }
+                                }).detach();
                             }
                         }
                         cx.notify();

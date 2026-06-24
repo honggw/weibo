@@ -31,8 +31,6 @@ pub struct ChatData {
     pub show_emoji_panel: bool,
     /// 会话搜索文本
     pub search_text: String,
-    /// 搜索过滤后的联系人
-    pub filtered_contacts: Vec<Contact>,
     /// 当前群信息 (群聊时)
     pub group_info: Option<GroupInfo>,
 }
@@ -44,10 +42,37 @@ impl ChatData {
             selected_uid: None, messages: Vec::new(), messages_loading: false,
             oldest_mid: None, has_more: true, draft_text: String::new(), input_focus: None, msg_list_state: None,
             emotions: Vec::new(), show_emoji_panel: false,
-            search_text: String::new(), filtered_contacts: Vec::new(),
+            search_text: String::new(),
             group_info: None,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// ListState helpers — account for TimeSeparator items (see chat_screen::build_list_items)
+// ---------------------------------------------------------------------------
+
+/// 计算包含时间分割线的消息列表项总数。
+/// 规则与 `chat_screen::build_list_items` 保持一致:
+/// 如果两条相邻消息的 timestamp 间隔 > 300 秒 (5分钟), 插入一条分割线。
+pub fn count_list_items(msgs: &[ChatMessage]) -> usize {
+    let mut separators: usize = 0;
+    for (i, msg) in msgs.iter().enumerate() {
+        let needs_separator = i == 0
+            || (msg.timestamp > 0
+                && msgs[i - 1].timestamp > 0
+                && msg.timestamp.saturating_sub(msgs[i - 1].timestamp) > 300);
+        if needs_separator && msg.timestamp > 0 {
+            separators += 1;
+        }
+    }
+    msgs.len() + separators
+}
+
+/// 重建 msg_list_state, 使用包含 TimeSeparator 的真实项数。
+pub fn rebuild_msg_list_state(chat: &mut ChatData, alignment: ListAlignment) {
+    let item_count = count_list_items(&chat.messages);
+    chat.msg_list_state = Some(ListState::new(item_count, alignment, px(50.0)));
 }
 
 /// Spawn loading contacts list.
@@ -80,6 +105,8 @@ pub fn load_chat_data(cx: &mut Context<AppRoot>, handle: &tokio::runtime::Handle
 /// Select a contact and load message history.
 pub fn select_contact(cx: &mut Context<AppRoot>, handle: &tokio::runtime::Handle, uid: String, my_uid: String, is_group: bool) {
     let handle = handle.clone();
+    let uid_for_group = uid.clone(); // clone before move for group info fetch
+    let handle_for_group = handle.clone();
     cx.spawn(move |this: WeakEntity<AppRoot>, cx: &mut AsyncApp| {
         let mut cx = cx.clone();
         async move {
@@ -97,26 +124,37 @@ pub fn select_contact(cx: &mut Context<AppRoot>, handle: &tokio::runtime::Handle
                     chat.messages_loading = false;
                     let count = chat.messages.len();
                     log_info!("[chat_vm] 加载 {} 条消息, oldest_mid={:?}, has_more={}", count, chat.oldest_mid, chat.has_more);
-                    chat.msg_list_state = Some(ListState::new(count, ListAlignment::Bottom, px(50.0)));
+                    rebuild_msg_list_state(chat, ListAlignment::Bottom);
                 }
                 cx.notify();
             }).ok();
 
-            // Fetch group info in background
-            if is_group {
-                let gid = uid;
-                tokio::spawn(async move {
-                    if let Some(info) = chat_service::fetch_group_info(&gid).await {
-                        log_info!("[chat_vm] 群信息已获取: {:?}", info.name);
-                    }
-                });
-            }
             // Report read status
-            tokio::spawn(async move {
+            handle.spawn(async move {
                 chat_service::report_read(&uid_for_report).await;
             });
         }
     }).detach();
+
+    // Fetch group info in background (separate task, non-blocking)
+    if is_group {
+        let gid = uid_for_group;
+        let h = handle_for_group;
+        cx.spawn(|this: WeakEntity<AppRoot>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                if let Some(info) = h.block_on(chat_service::fetch_group_info(&gid)) {
+                    log_info!("[chat_vm] 群信息已获取: {:?}", info.name);
+                    this.update(&mut cx, |v, cx| {
+                        if let Some(chat) = v.chat_data.as_mut() {
+                            chat.group_info = Some(info);
+                        }
+                        cx.notify();
+                    }).ok();
+                }
+            }
+        }).detach();
+    }
 }
 
 /// Load older messages (pagination — scroll up).
@@ -138,7 +176,8 @@ pub fn load_more_messages(cx: &mut Context<AppRoot>, handle: &tokio::runtime::Ha
                         let mut all = older;
                         all.append(&mut chat.messages);
                         chat.messages = all;
-                        chat.msg_list_state = Some(ListState::new(chat.messages.len(), ListAlignment::Top, px(50.0)));
+                        // Use Top alignment to maintain scroll position when loading older messages
+                        rebuild_msg_list_state(chat, ListAlignment::Top);
                         log_info!("[chat_vm] 加载更早 {} 条消息, 总计 {} 条, has_more={}", count, chat.messages.len(), chat.has_more);
                     } else {
                         chat.has_more = false;
@@ -163,6 +202,8 @@ pub fn send_message(cx: &mut Context<AppRoot>, handle: &tokio::runtime::Handle, 
                 if let Some(chat) = v.chat_data.as_mut() {
                     if let Some(msg) = sent {
                         chat.messages.push(msg);
+                        // Rebuild ListState so new message is visible (Accounts for TimeSeparators)
+                        rebuild_msg_list_state(chat, ListAlignment::Bottom);
                     }
                 }
                 cx.notify();

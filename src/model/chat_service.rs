@@ -201,16 +201,14 @@ pub async fn fetch_group_messages(
                             let role = m.get("from_user_role")
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(0) as u8;
-                            // 解析图片 fids: "[5312697042208502]" -> vec!["5312697042208502"]
-                            let fids = m
+                            // 解析图片 fids — API 返回的是 JSON Array，不是 String
+                            let fids: Vec<String> = m
                                 .get("fids")
-                                .and_then(|v| v.as_str())
-                                .map(|s| {
-                                    s.trim_matches(|c| c == '[' || c == ']')
-                                        .split(',')
-                                        .filter(|s| !s.is_empty())
-                                        .map(|s| s.trim().to_string())
-                                        .collect::<Vec<_>>()
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|v| v.as_u64().map(|n| n.to_string()))
+                                        .collect()
                                 })
                                 .unwrap_or_default();
 
@@ -288,16 +286,21 @@ pub async fn fetch_messages(
                                 .get("group_chat_message_type")
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(321);
-                            let fids_str = m.get("fids").and_then(|v| v.as_str()).unwrap_or("");
-                            let fids = fids_str
-                                .trim_matches(|c| c == '[' || c == ']')
-                                .split(',')
-                                .filter(|s| !s.is_empty())
-                                .map(|s| s.trim().to_string())
-                                .collect::<Vec<_>>();
+                            // 解析图片 fids — API 返回的是 JSON Array
+                            let fids: Vec<String> = m.get("fids")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| arr.iter()
+                                    .filter_map(|v| v.as_u64().map(|n| n.to_string()))
+                                    .collect())
+                                .unwrap_or_default();
                             let role = m.get("sender_role")
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(0) as u8;
+                            let created_at_str = m
+                                .get("created_at")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let timestamp = parse_dm_timestamp(created_at_str);
 
                             crate::domain::ChatMessage {
                                 id: m
@@ -317,12 +320,8 @@ pub async fn fetch_messages(
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("")
                                     .to_string(),
-                                created_at: m
-                                    .get("created_at")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                                timestamp: 0, // DM 接口是字符串时间, 可后续解析
+                                created_at: created_at_str.to_string(),
+                                timestamp,
                                 is_self: sid == my_uid,
                                 msg_type: crate::domain::MsgType::from_api(type_val),
                                 media_type: crate::domain::MediaType::from_api(media_val),
@@ -372,7 +371,7 @@ async fn send_dm_message(uid: &str, text: &str) -> Option<crate::domain::ChatMes
     log_info!(
         "[chat] 发送消息: uid={}, text={}...",
         uid,
-        &text[..text.len().min(20)]
+        text.chars().take(20).collect::<String>()
     );
     match client
         .post(&url)
@@ -435,7 +434,7 @@ async fn send_group_message(gid: &str, text: &str) -> Option<crate::domain::Chat
     let encoded_text = url::form_urlencoded::byte_serialize(text.as_bytes()).collect::<String>();
     let params = format!("content={}&id={}&source={}", encoded_text, gid, SOURCE);
 
-    log_info!("[chat] Group send: gid={}, text={}...", gid, &text[..text.len().min(20)]);
+    log_info!("[chat] Group send: gid={}, text={}...", gid, text.chars().take(20).collect::<String>());
     match client.post(&url).header("Cookie", &cookie).header("Referer", format!("{}/chat", CHAT_BASE))
         .header("User-Agent", config::DEFAULT_UA).header("Content-Type", "application/x-www-form-urlencoded")
         .header("X-XSRF-TOKEN", &xsrf).body(params).timeout(config::REQUEST_TIMEOUT).send().await
@@ -588,7 +587,7 @@ fn parse_contact(c: &serde_json::Value) -> Option<Contact> {
     })
 }
 
-/// 将 Unix 时间戳格式化为可读时间字符串。
+/// 将 Unix 时间戳格式化为可读时间字符串 (东八区)。
 /// 今天的消息只显示 "HH:MM", 昨天显示 "昨天 HH:MM", 其他日期显示 "MM-DD HH:MM"。
 fn format_timestamp(ts: u64) -> String {
     if ts == 0 {
@@ -596,10 +595,10 @@ fn format_timestamp(ts: u64) -> String {
     }
     // 东八区偏移 (秒)
     let tz_offset: i64 = 8 * 3600;
-    let local_ts = ts as i64 + tz_offset;
     let secs_in_day: i64 = 86400;
+    let local_ts = ts as i64 + tz_offset;
 
-    // 获取当前本地时间 (近似: SystemTime + 东八区偏移)
+    // 当前本地时间
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -616,18 +615,92 @@ fn format_timestamp(ts: u64) -> String {
     } else if msg_day == now_day - 1 {
         format!("昨天 {:02}:{:02}", hour, minute)
     } else {
-        // 简易月/日计算 (近似)
-        let days_since_year_start = local_ts % (365 * secs_in_day);
-        let month_approx = (days_since_year_start / (30 * secs_in_day)) + 1;
-        let day_approx = ((days_since_year_start % (30 * secs_in_day)) / secs_in_day) + 1;
-        format!(
-            "{:02}-{:02} {:02}:{:02}",
-            month_approx.min(12).max(1),
-            day_approx.min(31).max(1),
-            hour,
-            minute
-        )
+        // 使用更精确的日历计算 (基于 Unix epoch: 1970-01-01)
+        let (month, day) = month_day_from_day_index(msg_day);
+        format!("{:02}-{:02} {:02}:{:02}", month, day, hour, minute)
     }
+}
+
+/// 从 1970-01-01 起的天数索引计算 (月, 日)。
+/// 使用各月实际天数，处理闰年。
+fn month_day_from_day_index(day_index: i64) -> (u32, u32) {
+    let mut remaining = day_index;
+    let mut year: i64 = 1970;
+    loop {
+        let days_in_year = if is_leap(year) { 366 } else { 365 };
+        if remaining < days_in_year {
+            break;
+        }
+        remaining -= days_in_year;
+        year += 1;
+    }
+    let months_days: [i64; 12] = if is_leap(year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut month: u32 = 1;
+    for md in months_days.iter() {
+        if remaining < *md {
+            break;
+        }
+        remaining -= *md;
+        month += 1;
+    }
+    let day = (remaining + 1) as u32;
+    (month, day)
+}
+
+fn is_leap(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+/// 解析 DM 接口的 created_at 字符串 (格式: "Wed Jun 24 12:07:17 +0800 2026") 为 Unix 时间戳。
+/// 如果解析失败, 返回 0。
+pub fn parse_dm_timestamp(created_at: &str) -> u64 {
+    // 示例: "Wed Jun 24 12:07:17 +0800 2026"
+    let parts: Vec<&str> = created_at.split_whitespace().collect();
+    if parts.len() < 6 {
+        return 0;
+    }
+    // 月份缩写 → 数字
+    let month: i64 = match parts.get(1).copied().unwrap_or("") {
+        "Jan" => 1, "Feb" => 2, "Mar" => 3, "Apr" => 4,
+        "May" => 5, "Jun" => 6, "Jul" => 7, "Aug" => 8,
+        "Sep" => 9, "Oct" => 10, "Nov" => 11, "Dec" => 12,
+        _ => return 0,
+    };
+    let day: i64 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+    if day == 0 { return 0; }
+
+    let time: Vec<&str> = parts.get(3).unwrap_or(&"").split(':').collect();
+    if time.len() < 3 { return 0; }
+    let hour: i64 = time[0].parse().unwrap_or(0);
+    let minute: i64 = time[1].parse().unwrap_or(0);
+    let second: i64 = time[2].parse().unwrap_or(0);
+
+    let year: i64 = parts.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
+    if year < 2000 { return 0; }
+
+    // 计算从 1970-01-01 到给定日期的天数
+    let mut days: i64 = 0;
+    for y in 1970..year {
+        days += if is_leap(y) { 366 } else { 365 };
+    }
+    let months_days: [i64; 12] = if is_leap(year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    for m in 0..(month - 1) as usize {
+        days += months_days[m];
+    }
+    days += day - 1;
+
+    // 忽略时区偏移, 按东八区处理
+    let tz_offset: i64 = 8 * 3600;
+    let timestamp = (days * 86400) + (hour * 3600) + (minute * 60) + second - tz_offset;
+    if timestamp < 0 { 0 } else { timestamp as u64 }
 }
 
 /// 获取微博表情列表
@@ -736,17 +809,33 @@ pub async fn fetch_group_info(gid: &str) -> Option<crate::domain::GroupInfo> {
                     .get("member_count")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
+                // 优先使用 member_infos (包含详细信息), 其次 members 数组
                 let members: Vec<crate::domain::GroupMember> = data
-                    .get("members")
+                    .get("member_infos")
+                    .or_else(|| data.get("members"))
                     .and_then(|m| m.as_array())
                     .map(|arr| {
                         arr.iter()
                             .filter_map(|m| {
+                                // 如果元素是数字 (UID), 用 UID 同时作为 uid 和 screen_name
+                                if let Some(uid_num) = m.as_u64() {
+                                    let uid = uid_num.to_string();
+                                    return Some(crate::domain::GroupMember {
+                                        uid,
+                                        screen_name: String::new(),
+                                        avatar: String::new(),
+                                        is_admin: false,
+                                    });
+                                }
+                                // 否则按对象解析
                                 let uid = m
                                     .get("uid")
                                     .and_then(|v| v.as_u64())
                                     .map(|v| v.to_string())
                                     .unwrap_or_default();
+                                if uid.is_empty() {
+                                    return None;
+                                }
                                 let screen_name = m
                                     .get("screen_name")
                                     .and_then(|v| v.as_str())
@@ -789,4 +878,58 @@ pub async fn fetch_group_info(gid: &str) -> Option<crate::domain::GroupInfo> {
         Err(e) => log_info!("[chat] 获取群信息失败: {}", e),
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Image helpers
+// ---------------------------------------------------------------------------
+
+/// 根据 fid 拼接微博图片缩略图 URL.
+/// 群聊图片额外需要 gid 参数。
+///
+/// # Examples
+/// ```
+/// let url = thumb_url("5312697042208502", None);
+/// // => "https://upload.api.weibo.com/2/mss/msget_thumbnail?fid=5312697042208502&high=240&width=240&size=240,240&source=209678993"
+/// ```
+pub fn thumb_url(fid: &str, gid: Option<&str>) -> String {
+    let base = "https://upload.api.weibo.com/2/mss/msget_thumbnail";
+    if let Some(g) = gid {
+        format!(
+            "{base}?fid={fid}&high=240&width=240&gid={g}&size=240,240&source={SOURCE}"
+        )
+    } else {
+        format!(
+            "{base}?fid={fid}&high=240&width=240&size=240,240&source={SOURCE}"
+        )
+    }
+}
+
+/// 下载图片 bytes (用于无法直接使用 ImageSource::Uri 的 GPUI 0.2)。
+/// 返回 PNG/JPEG 字节数据。
+pub async fn download_image(url: &str) -> Option<Vec<u8>> {
+    let (cookie, _xsrf) = chat_headers();
+    let client = http_client::build_no_store();
+    match client
+        .get(url)
+        .header("Cookie", &cookie)
+        .header("Referer", format!("{}/chat", CHAT_BASE))
+        .header("User-Agent", config::DEFAULT_UA)
+        .timeout(config::REQUEST_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                resp.bytes().await.ok().map(|b| b.to_vec())
+            } else {
+                log_info!("[chat] 下载图片失败: status={}", resp.status());
+                None
+            }
+        }
+        Err(e) => {
+            log_info!("[chat] 下载图片失败: {}", e);
+            None
+        }
+    }
 }

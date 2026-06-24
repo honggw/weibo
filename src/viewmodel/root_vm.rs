@@ -94,6 +94,13 @@ impl AppRoot {
         if text.is_empty() { return; }
 
         let is_self = sender_id == chat.my_uid;
+        // 解析 fids 为 JSON 数组 (API 返回的是 Array 而非 String)
+        let fids: Vec<String> = msg.data.get("fids")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter()
+                .filter_map(|v| v.as_u64().map(|n| n.to_string()))
+                .collect())
+            .unwrap_or_default();
         let new_msg = ChatMessage {
             id: String::new(),
             sender_id,
@@ -112,12 +119,7 @@ impl AppRoot {
             media_type: crate::domain::MediaType::from_api(
                 msg.data.get("media_type").and_then(|v| v.as_u64()).unwrap_or(0)
             ),
-            fids: msg.data.get("fids")
-                .and_then(|v| v.as_str())
-                .map(|s| s.trim_matches(|c| c == '[' || c == ']')
-                    .split(',').filter(|s| !s.is_empty())
-                    .map(|s| s.trim().to_string()).collect())
-                .unwrap_or_default(),
+            fids,
             role: msg.data.get("from_user_role")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u8,
@@ -126,10 +128,8 @@ impl AppRoot {
         // If this contact is currently selected, append to message list
         if chat.selected_uid.as_ref() == Some(&contact_uid) {
             chat.messages.push(new_msg);
-            if let Some(ref lst) = chat.msg_list_state {
-                // Note: ListState doesn't have an easy way to increment, so we recreate
-                chat.msg_list_state = Some(ListState::new(chat.messages.len(), ListAlignment::Bottom, px(50.0)));
-            }
+            // Always rebuild ListState after push (not gated on existing state)
+            crate::viewmodel::chat_vm::rebuild_msg_list_state(chat, ListAlignment::Bottom);
             log_info!("[ws] 已追加消息到当前会话: {}", text.chars().take(20).collect::<String>());
         }
 
@@ -236,24 +236,28 @@ impl Render for AppRoot {
             }
             if !self.ws_started {
                 self.ws_started = true;
-                let uid = self.chat_data.as_ref().and_then(|c| if c.my_uid.is_empty() { None } else { Some(c.my_uid.clone()) }).unwrap_or_else(|| "1744323680".to_string());
-                log_info!("[ws] 启动 WebSocket, uid={}", uid);
-                let mut rx = crate::model::chat_service::start_ws(uid, &self.tokio_handle);
-                // Spawn GPUI task to poll WS messages and update chat_data
-                cx.spawn(|this: WeakEntity<AppRoot>, cx: &mut AsyncApp| {
-                    let mut cx = cx.clone();
-                    async move {
-                        while let Some(msg) = rx.recv().await {
-                            if let Err(_) = this.update(&mut cx, |v, cx| {
-                                let chat = v.chat_data.get_or_insert_with(ChatData::new);
-                                Self::handle_ws_message(chat, msg);
-                                cx.notify();
-                            }) {
-                                break; // Entity released
+                // Only start WebSocket if we have a valid user ID
+                if let Some(uid) = self.chat_data.as_ref().and_then(|c| if c.my_uid.is_empty() { None } else { Some(c.my_uid.clone()) }) {
+                    log_info!("[ws] 启动 WebSocket, uid={}", uid);
+                    let mut rx = crate::model::chat_service::start_ws(uid, &self.tokio_handle);
+                    // Spawn GPUI task to poll WS messages and update chat_data
+                    cx.spawn(|this: WeakEntity<AppRoot>, cx: &mut AsyncApp| {
+                        let mut cx = cx.clone();
+                        async move {
+                            while let Some(msg) = rx.recv().await {
+                                if let Err(_) = this.update(&mut cx, |v, cx| {
+                                    let chat = v.chat_data.get_or_insert_with(ChatData::new);
+                                    Self::handle_ws_message(chat, msg);
+                                    cx.notify();
+                                }) {
+                                    break; // Entity released
+                                }
                             }
                         }
-                    }
-                }).detach();
+                    }).detach();
+                } else {
+                    log_info!("[ws] 跳过启动 WebSocket: my_uid 不可用");
+                }
             }
         }
 

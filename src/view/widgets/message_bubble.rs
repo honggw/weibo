@@ -34,29 +34,19 @@ fn render_normal(msg: &ChatMessage) -> AnyElement {
     let bubble_color = if is_self { rgb(theme::CLR_ACCENT) } else { rgb(0x2a3a5a) };
     let text_color = if is_self { rgb(0xffffff) } else { rgb(theme::CLR_TEXT) };
 
-    // 头像: 优先真实头像, 回退到首字占位圆
+    // 头像: 首字占位圆 (后续可通过 sender_avatar 加载真实头像)
     let avatar_char = if is_self {
         "我".to_string()
     } else {
         msg.sender_name.chars().next().map(|c| c.to_string()).unwrap_or_default()
     };
-    let avatar = if !msg.sender_avatar.is_empty() {
-        div()
-            .w(px(36.0)).h(px(36.0)).rounded_full()
-            .bg(if is_self { rgb(theme::CLR_ACCENT) } else { rgb(0x3a4a6a) })
-            .flex().items_center().justify_center()
-            .text_size(px(14.0)).text_color(rgb(0xffffff)).flex_shrink_0()
-            .child(avatar_char)
-            .into_any_element()
-    } else {
-        div()
-            .w(px(36.0)).h(px(36.0)).rounded_full()
-            .bg(if is_self { rgb(theme::CLR_ACCENT) } else { rgb(0x3a4a6a) })
-            .flex().items_center().justify_center()
-            .text_size(px(14.0)).text_color(rgb(0xffffff)).flex_shrink_0()
-            .child(avatar_char)
-            .into_any_element()
-    };
+    let avatar = div()
+        .w(px(36.0)).h(px(36.0)).rounded_full()
+        .bg(if is_self { rgb(theme::CLR_ACCENT) } else { rgb(0x3a4a6a) })
+        .flex().items_center().justify_center()
+        .text_size(px(14.0)).text_color(rgb(0xffffff)).flex_shrink_0()
+        .child(avatar_char)
+        .into_any_element();
 
     // 气泡内容
     let bubble_content = match &msg.media_type {
@@ -111,24 +101,42 @@ fn render_text_bubble(msg: &ChatMessage, bg: Rgba, fg: Rgba) -> AnyElement {
         .into_any_element()
 }
 
-/// 图片消息气泡 — 显示 [图片] 占位
+/// 图片消息气泡 — 显示占位符及 fid 数量信息。
+/// 注: GPUI 0.2 不支持 ImageSource::Uri, 缩略图需手动下载后用 ImageSource::Image 渲染。
 fn render_image_bubble(msg: &ChatMessage, _bg: Rgba, fg: Rgba) -> AnyElement {
+    let fid_count = msg.fids.len();
+    let thumb_info = if fid_count > 0 {
+        let first_fid = &msg.fids[0];
+        format!("{} 张图片\nfid: {}...", fid_count, &first_fid[..first_fid.len().min(12)])
+    } else {
+        "图片".to_string()
+    };
+
     div()
         .px_3().py_2().rounded_lg().bg(_bg)
         .child(
             div().flex().flex_col().gap_1()
                 .child(
                     div()
-                        .w(px(200.0)).h(px(120.0)).rounded_md()
+                        .min_w(px(120.0)).min_h(px(80.0)).rounded_md()
                         .bg(rgb(0x2a3a5a))
-                        .flex().items_center().justify_center()
-                        .text_size(px(24.0)).text_color(rgb(theme::CLR_MUTED))
-                        .child("🖼")
+                        .flex().flex_col().items_center().justify_center().gap_1()
+                        .px_3().py_2()
+                        .child(
+                            div()
+                                .text_size(px(28.0)).text_color(rgb(theme::CLR_MUTED))
+                                .child("🖼")
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0)).text_color(rgb(theme::CLR_MUTED))
+                                .child(thumb_info)
+                        )
                 )
                 .child(if !msg.text.is_empty() && msg.text != "分享图片" {
                     div().text_size(px(13.0)).text_color(fg).child(msg.text.clone()).into_any_element()
                 } else {
-                    div().text_size(px(12.0)).text_color(rgb(theme::CLR_MUTED)).child("[图片]").into_any_element()
+                    div().into_any_element()
                 })
         )
         .into_any_element()

@@ -36,6 +36,9 @@ image = "0.25"
 # GPUI — GPU-accelerated UI framework
 gpui = "0.2"
 
+# Audio playback (new message notification)
+rodio = "0.19"
+
 # MITM proxy
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 rustls = "0.23"

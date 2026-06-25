@@ -1,650 +1,890 @@
-# 微博 PC 客户端 - 聊天界面 Bug 修复计划
+# 微博 PC 客户端 — UI 层重构计划: GPUI → Tauri
 
-> 基于 `failed.png` 截图分析的 4 个 UI 问题，结合 `review.md` 中的代码审查结论。
-
----
-
-## 问题一览
-
-| # | 问题描述 | 根因 | 涉及文件 |
-|---|---------|------|---------|
-| 1 | 未读数角标被拉长 | `rounded_full` + 无固定最小宽高，数字较长时胶囊变形 | `contact_card.rs` |
-| 2 | 聊天消息互相覆盖 | ListState item_count 与实际项数不一致 + 估算行高过小 | `chat_vm.rs`, `chat_screen.rs`, `root_vm.rs` |
-| 3 | 图片渲染失败 | `fids` 解析逻辑错误(JSON array 被 `as_str()`) + 占位图无内容 | `chat_service.rs`, `message_bubble.rs` |
-| 4 | 滚轮无法触发加载更多 | 消息列表无 scroll_handler，仅有手动按钮 | `chat_screen.rs`, `chat_vm.rs` |
+> 目标: 将 UI 渲染层从 GPUI 迁移到 Tauri (WebView)，保留底层业务逻辑不变。
 
 ---
 
-## 修复一: 未读数角标拉长
+## 一、现状分析
 
-### 1.1 问题分析
+### 1.1 当前模块结构
 
-截图中右侧会话列表的未读数角标（如 "22"、"3"）被水平拉长，变成了椭圆/长条形状。
-
-**根因**: `contact_card.rs` 第 57 行：
-```rust
-div().px_2().py_0p5().rounded_full().bg(rgb(theme::CLR_ACCENT))
-    .text_size(px(11.0)).text_color(rgb(0xffffff))
-    .child(format!("{}", contact.unread_count))
+```
+src/
+├── domain/mod.rs          ← 纯数据结构 (零依赖)
+├── infra/                 ← 基础设施 (HTTP, WS, Cookie, Audio, Config)
+├── model/                 ← 业务服务 (auth_service, chat_service, timeline_service)
+├── viewmodel/             ← 状态机 (root_vm, login_vm, home_vm, chat_vm)
+├── view/                  ← GPUI 渲染 (screens, widgets, theme, app_shell)
+├── cli/                   ← CLI 模式 (QR/Cookie 登录)
+├── legacy/                ← 遗留代码 (WebView login, proxy)
+├── qr_login.rs            ← QR 登录协议
+├── logger.rs              ← 日志宏
+└── main.rs                ← 入口
 ```
 
-- `rounded_full()` 的圆角是 9999px，在正方形上显示为圆形，但在矩形上显示为胶囊。
-- 没有设置 `min_w` / `h` / `items_center` / `justify_center`，内容区域由文本撑开，两位数以上就变形。
+### 1.2 GPUI 耦合清单
 
-### 1.2 修复方案
-
-**文件**: `src/view/widgets/contact_card.rs` 第 56-61 行
-
-**当前代码**:
-```rust
-.child(if contact.unread_count > 0 {
-    div().px_2().py_0p5().rounded_full().bg(rgb(theme::CLR_ACCENT))
-        .text_size(px(11.0)).text_color(rgb(0xffffff))
-        .child(format!("{}", contact.unread_count))
-        .into_any_element()
-} else {
-    div().into_any_element()
-})
-```
-
-**改为**:
-```rust
-.child(if contact.unread_count > 0 {
-    let text = if contact.unread_count > 99 {
-        "99+".to_string()
-    } else {
-        format!("{}", contact.unread_count)
-    };
-    div()
-        .min_w(px(18.0))   // 最小宽度，保证单位数也是圆形
-        .h(px(18.0))       // 固定高度
-        .flex()            // 启用 flex 以便居中
-        .items_center()
-        .justify_center()
-        .rounded_full()
-        .bg(rgb(theme::CLR_ACCENT))
-        .text_size(px(10.0))
-        .text_color(rgb(0xffffff))
-        .flex_shrink_0()   // 不被父容器压缩
-        .child(text)
-        .into_any_element()
-} else {
-    div().into_any_element()
-})
-```
-
-**关键改动**:
-- `min_w(px(18.0))` + `h(px(18.0))` 保证单位数时是正圆
-- `flex()` + `items_center()` + `justify_center()` 让文字居中
-- `flex_shrink_0()` 防止被父级 `justify_between` 压缩
-- `text_size` 减小到 10px 避免撑破容器
-- 超过 99 截断为 "99+"
+| 模块 | GPUI 依赖项 | 耦合程度 |
+|------|------------|---------|
+| `view/` (全部 11 个文件) | `div()`, `list()`, `Render`, `IntoElement`, `AnyElement`, `px()`, `rgb()`, 事件系统 | 完全耦合 |
+| `viewmodel/root_vm.rs` | `Entity<AppRoot>`, `Context<Self>`, `Render` trait, `ListState`, `cx.spawn`, `cx.notify`, `WeakEntity` | 重度耦合 |
+| `viewmodel/login_vm.rs` | `WeakEntity`, `AsyncApp`, `cx.spawn`, `cx.notify`, `Timer::after` | 重度耦合 |
+| `viewmodel/home_vm.rs` | `WeakEntity`, `AsyncApp`, `cx.spawn`, `cx.notify`, `ListState`, `Timer::after` | 重度耦合 |
+| `viewmodel/chat_vm.rs` | `WeakEntity`, `AsyncApp`, `cx.spawn`, `cx.notify`, `ListState`, `ListAlignment`, `FocusHandle` | 重度耦合 |
+| `view/app_shell.rs` | `Application::new()`, `WindowOptions`, `cx.open_window` | 完全耦合 |
+| `domain/` | 无 | 无耦合 ✅ |
+| `infra/` | 无 | 无耦合 ✅ |
+| `model/` | 无 | 无耦合 ✅ |
+| `cli/` | 无 | 无耦合 ✅ |
 
 ---
 
-## 修复二: 聊天消息互相覆盖
+## 二、目标架构
 
-### 2.1 问题分析
+```
+weibo/
+├── src-tauri/                    ← Tauri Rust 后端
+│   ├── Cargo.toml
+│   ├── tauri.conf.json
+│   ├── src/
+│   │   ├── main.rs              ← Tauri 入口 (替代 GPUI Application)
+│   │   ├── state.rs             ← AppState (替代 AppRoot Entity)
+│   │   ├── commands/            ← Tauri Commands (替代 viewmodel/)
+│   │   │   ├── mod.rs
+│   │   │   ├── auth.rs          ← 登录相关命令
+│   │   │   ├── chat.rs          ← 聊天相关命令
+│   │   │   └── timeline.rs      ← 时间线相关命令
+│   │   ├── events.rs            ← Tauri Events 定义 (替代 cx.notify)
+│   │   ├── domain/              ← 原样搬入 + 加 Serialize
+│   │   │   └── mod.rs
+│   │   ├── infra/               ← 原样搬入
+│   │   │   ├── mod.rs
+│   │   │   ├── http_client.rs
+│   │   │   ├── ws_client.rs
+│   │   │   ├── cookie_io.rs
+│   │   │   ├── audio.rs
+│   │   │   ├── config.rs
+│   │   │   └── logger.rs
+│   │   ├── model/               ← 原样搬入
+│   │   │   ├── mod.rs
+│   │   │   ├── auth_service.rs
+│   │   │   ├── chat_service.rs
+│   │   │   └── timeline_service.rs
+│   │   ├── cli/                 ← 原样搬入
+│   │   └── qr_login.rs         ← 原样搬入
+│   └── icons/
+├── src/                          ← 前端 (WebView)
+│   ├── index.html
+│   ├── main.ts                  ← 前端入口
+│   ├── App.vue                  ← 根组件
+│   ├── router/                  ← 路由 (login / home / chat)
+│   ├── stores/                  ← Pinia 状态管理 (替代 viewmodel 前端部分)
+│   │   ├── auth.ts
+│   │   ├── chat.ts
+│   │   └── timeline.ts
+│   ├── views/                   ← 页面 (替代 view/screens/)
+│   │   ├── LoginView.vue
+│   │   ├── HomeView.vue
+│   │   └── ChatView.vue
+│   ├── components/              ← 组件 (替代 view/widgets/)
+│   │   ├── HeaderBar.vue
+│   │   ├── ContactCard.vue
+│   │   ├── MessageBubble.vue
+│   │   ├── TimelineCard.vue
+│   │   ├── QrDisplay.vue
+│   │   ├── EmojiPanel.vue
+│   │   └── MemberSidebar.vue
+│   ├── styles/                  ← 样式 (替代 view/theme.rs)
+│   │   └── theme.css
+│   └── types/                   ← TypeScript 类型定义 (对应 domain/)
+│       └── index.ts
+├── package.json
+├── vite.config.ts
+└── tsconfig.json
+```
 
-截图中可明显看到多条消息的气泡在垂直方向上重叠，文字互相遮挡。
+---
 
-**根因（3 重叠加）**:
+## 三、技术选型
 
-1. **ListState item_count 不匹配**: `ListState::new(count, ...)` 中 `count` 是 `chat.messages.len()` (原始消息数)，但渲染时 `build_list_items()` 会插入 `TimeSeparator` 使实际项数更多。GPUI 只分配 `count` 个 slot 的布局空间，多余的项被挤压/重叠。
+| 层面 | 选择 | 理由 |
+|------|------|------|
+| 桌面框架 | **Tauri 2.x** | Rust 后端、WebView 渲染、体积小、跨平台 |
+| 前端框架 | **Vue 3 + TypeScript** | 组合式 API 适合状态管理、生态丰富、上手快 |
+| 构建工具 | **Vite** | 快速 HMR、Tauri 官方推荐 |
+| 状态管理 | **Pinia** | Vue 3 官方推荐、TypeScript 友好 |
+| UI 组件库 | **不使用** (手写 CSS) | 保持轻量、设计还原度高 |
+| 虚拟滚动 | **vue-virtual-scroller** 或 **@tanstack/vue-virtual** | 替代 GPUI ListState |
+| CSS 方案 | **Tailwind CSS** | 原子类方式类似 GPUI 的 `.flex().px_4()` 风格 |
 
-2. **overdraw 过小**: `ListState::new(count, ..., px(50.0))` 的 overdraw=50px，意味着 GPUI 只预渲染可视区域上下 50px 的项。消息气泡（尤其带引用的）高度远超 50px，导致测量不足、布局错位。
+---
 
-3. **send_message 后不更新 ListState**: 发消息追加后 ListState 不知道新增了项，下次渲染时内部状态错乱。
+## 四、分阶段实施计划
 
-### 2.2 修复方案
+### Phase 0: 项目初始化 (预计 1 天)
 
-#### 2.2.1 统一 ListState 创建逻辑 — 新增辅助函数
+#### 0.1 创建 Tauri 项目骨架
 
-**文件**: `src/viewmodel/chat_vm.rs`
+```bash
+# 在项目根目录
+npm create tauri-app@latest . -- --template vue-ts
+```
 
-在文件顶部（`ChatData` 结构体定义之后）新增:
+#### 0.2 迁移无耦合模块
+
+将以下模块原样复制到 `src-tauri/src/`:
+- `domain/mod.rs`
+- `infra/` (全部 6 个文件)
+- `model/` (全部 3 个文件)
+- `cli/` (全部)
+- `qr_login.rs`
+- `logger.rs`
+
+#### 0.3 配置 Cargo.toml
+
+```toml
+[package]
+name = "weibo"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+
+# 保留原有业务依赖
+reqwest = { version = "0.12", features = ["cookies", "json"] }
+anyhow = "1"
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+base64 = "0.22"
+rsa = "0.9"
+rand = "0.8"
+hex = "0.4"
+url = "2"
+aes = "0.8"
+cbc = "0.1"
+sha2 = "0.10"
+image = "0.25"
+rodio = "0.19"
+
+# 移除 gpui, wry, tao
+```
+
+#### 0.4 验收标准
+- [ ] `cargo build` (src-tauri) 编译通过
+- [ ] `npm run tauri dev` 能打开空白窗口
+- [ ] domain/infra/model 模块编译无报错
+
+---
+
+### Phase 1: 后端状态层重构 (预计 2 天)
+
+#### 1.1 创建 `state.rs` — 全局应用状态
+
+替代 GPUI 的 `Entity<AppRoot>`，使用 `Arc<RwLock<>>` 管理共享状态:
 
 ```rust
-/// 计算包含时间分割线的消息列表真实项数。
-/// 规则: 第一条消息前 + 间隔超过 300 秒的相邻消息之间，各插入一条 TimeSeparator。
-pub fn compute_list_item_count(messages: &[ChatMessage]) -> usize {
-    let mut count = messages.len();
-    for (i, msg) in messages.iter().enumerate() {
-        if i == 0 {
-            if msg.timestamp > 0 {
-                count += 1;
-            }
-        } else if msg.timestamp > 0 && messages[i - 1].timestamp > 0
-            && msg.timestamp.saturating_sub(messages[i - 1].timestamp) > 300
-        {
-            count += 1;
-        }
-    }
-    count
+// src-tauri/src/state.rs
+use tokio::sync::RwLock;
+use crate::domain::*;
+
+/// 全局应用状态 (Tauri managed state)
+pub struct AppState {
+    /// 当前登录阶段
+    pub phase: RwLock<LoginPhase>,
+    /// 聊天数据
+    pub chat_data: RwLock<Option<ChatData>>,
+    /// 时间线数据
+    pub timeline: RwLock<TimelineState>,
+    /// 当前激活的 Tab
+    pub active_tab: RwLock<ActiveTab>,
+    /// DM 未读数
+    pub dm_unread: RwLock<u64>,
 }
 
-/// 为消息列表创建/重建 ListState，使用正确的 item_count 和 overdraw。
-pub fn rebuild_msg_list_state(messages: &[ChatMessage], alignment: ListAlignment) -> ListState {
-    let count = compute_list_item_count(messages);
-    // overdraw 设为 400px: 消息气泡最高约 200px (引用+长文本), 需要至少预渲染 2 条
-    ListState::new(count, alignment, px(400.0))
+pub struct TimelineState {
+    pub items: Vec<TimelineItem>,
+    pub title: String,
+    pub since_id: String,
+    pub feed_list_id: Option<String>,
+    pub loading_more: bool,
+}
+
+/// 聊天数据 (从 viewmodel/chat_vm.rs 的 ChatData 迁移, 去掉 UI 字段)
+pub struct ChatData {
+    pub contacts: Vec<Contact>,
+    pub loading: bool,
+    pub my_uid: String,
+    pub selected_uid: Option<String>,
+    pub messages: Vec<ChatMessage>,
+    pub messages_loading: bool,
+    pub oldest_mid: Option<String>,
+    pub has_more: bool,
+    pub emotions: Vec<Emotion>,
+    pub group_info: Option<GroupInfo>,
+    // 去掉: input_focus, msg_list_state, chat_list_state (UI 相关)
+    // 去掉: draft_text, show_emoji_panel, search_text (前端管理)
 }
 ```
 
-#### 2.2.2 修改 `select_contact` — 使用正确的 item_count
+**关键设计决策**:
+- 去掉所有 `ListState`、`FocusHandle`、`px()` 等 GPUI UI 状态
+- `draft_text`、`show_emoji_panel`、`search_text` 等纯前端交互状态移至前端 store
+- 使用 `RwLock` 而非 `Mutex`，允许多个读取者并行 (事件推送 + command 查询)
 
-**文件**: `src/viewmodel/chat_vm.rs` 第 100 行
+#### 1.2 创建 `events.rs` — 事件定义
 
-**当前**:
+替代 `cx.notify()` 的推送机制:
+
 ```rust
-chat.msg_list_state = Some(ListState::new(count, ListAlignment::Bottom, px(50.0)));
-```
+// src-tauri/src/events.rs
+use serde::Serialize;
+use crate::domain::*;
 
-**改为**:
-```rust
-chat.msg_list_state = Some(rebuild_msg_list_state(&chat.messages, ListAlignment::Bottom));
-```
+/// 登录阶段变更事件
+#[derive(Clone, Serialize)]
+pub struct LoginPhaseChanged {
+    pub phase: LoginPhasePayload,
+}
 
-#### 2.2.3 修改 `load_more_messages` — 使用正确的 item_count
+#[derive(Clone, Serialize)]
+#[serde(tag = "type")]
+pub enum LoginPhasePayload {
+    CheckingCookie,
+    Loading { message: String },
+    WaitingScan { status: String, qr_base64: Option<String> },
+    Exchanging { message: String },
+    FetchingHome,
+    HomeLoaded { item_count: usize, title: String },
+    Error { message: String },
+}
 
-**文件**: `src/viewmodel/chat_vm.rs` 第 141 行
+/// 新消息推送
+#[derive(Clone, Serialize)]
+pub struct NewMessage {
+    pub contact_uid: String,
+    pub message: ChatMessagePayload,
+}
 
-**当前**:
-```rust
-chat.msg_list_state = Some(ListState::new(chat.messages.len(), ListAlignment::Top, px(50.0)));
-```
+/// 聊天消息 (序列化版)
+#[derive(Clone, Serialize)]
+pub struct ChatMessagePayload {
+    pub id: String,
+    pub sender_id: String,
+    pub sender_name: String,
+    pub sender_avatar: String,
+    pub text: String,
+    pub timestamp: u64,
+    pub is_self: bool,
+    pub msg_type: String,
+    pub media_type: String,
+    pub fids: Vec<String>,
+    pub role: u8,
+}
 
-**改为**:
-```rust
-chat.msg_list_state = Some(rebuild_msg_list_state(&chat.messages, ListAlignment::Top));
-```
+/// DM 未读数更新
+#[derive(Clone, Serialize)]
+pub struct DmUnreadChanged {
+    pub count: u64,
+}
 
-#### 2.2.4 修改 `send_message` — 追加消息后更新 ListState
+/// 联系人列表更新
+#[derive(Clone, Serialize)]
+pub struct ContactsLoaded {
+    pub contacts: Vec<ContactPayload>,
+}
 
-**文件**: `src/viewmodel/chat_vm.rs` 第 162-166 行
-
-**当前**:
-```rust
-if let Some(msg) = sent {
-    chat.messages.push(msg);
+#[derive(Clone, Serialize)]
+pub struct ContactPayload {
+    pub user_id: String,
+    pub screen_name: String,
+    pub avatar: String,
+    pub unread_count: u64,
+    pub last_message: String,
+    pub last_time: String,
+    pub is_group: bool,
 }
 ```
 
-**改为**:
+#### 1.3 验收标准
+- [ ] `state.rs` 编译通过，所有字段类型与 domain 对齐
+- [ ] `events.rs` 所有事件类型可序列化 (`serde_json::to_string` 测试通过)
+- [ ] 编写单元测试验证 state 的读写锁行为
+
+---
+
+### Phase 2: Tauri Commands 层 (预计 3 天)
+
+替代 viewmodel 中的异步流程编排，将 `cx.spawn` + `cx.notify` 模式转为 `#[tauri::command]` + `app.emit`。
+
+#### 2.1 `commands/auth.rs` — 登录命令
+
+替代 `login_vm.rs` + `home_vm.rs`:
+
 ```rust
-if let Some(msg) = sent {
-    chat.messages.push(msg);
-    chat.msg_list_state = Some(rebuild_msg_list_state(&chat.messages, ListAlignment::Bottom));
-}
-```
+// src-tauri/src/commands/auth.rs
+use tauri::{AppHandle, State, Emitter};
+use crate::state::AppState;
+use crate::model::{auth_service, timeline_service};
+use crate::events::*;
 
-#### 2.2.5 修改 `root_vm.rs` `handle_ws_message` — WS 推送也更新 ListState
+/// 检查已保存的 Cookie 并自动登录
+#[tauri::command]
+pub async fn check_saved_cookie(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    // 对应 home_vm::start_cookie_flow
+    let cookie = auth_service::load_saved_cookie();
+    match cookie {
+        Some(cookie) => {
+            app.emit("login-phase-changed", LoginPhasePayload::Loading {
+                message: "验证 Cookie...".into()
+            }).ok();
 
-**文件**: `src/viewmodel/root_vm.rs` 第 127-132 行
-
-**当前**:
-```rust
-if chat.selected_uid.as_ref() == Some(&contact_uid) {
-    chat.messages.push(new_msg);
-    if let Some(ref lst) = chat.msg_list_state {
-        chat.msg_list_state = Some(ListState::new(chat.messages.len(), ListAlignment::Bottom, px(50.0)));
-    }
-}
-```
-
-**改为**:
-```rust
-if chat.selected_uid.as_ref() == Some(&contact_uid) {
-    chat.messages.push(new_msg);
-    // 始终重建 ListState (不论之前是否为 Some)
-    chat.msg_list_state = Some(
-        crate::viewmodel::chat_vm::rebuild_msg_list_state(&chat.messages, ListAlignment::Bottom)
-    );
-}
-```
-
-#### 2.2.6 `chat_screen.rs` — 渲染时校验 item_count（防御性）
-
-**文件**: `src/view/screens/chat_screen.rs` 第 306-332 行
-
-在使用 `msg_list_state` 前，检测实际 item count 是否匹配:
-
-**当前**:
-```rust
-.child(if !msgs.is_empty() {
-    if let Some(lst) = msg_list_state {
-        let items_for_list = list_items.clone();
-        list(lst, move |ix, _window, _cx| { ... })
-```
-
-**改为**:
-```rust
-.child(if !msgs.is_empty() {
-    if let Some(lst) = msg_list_state {
-        let items_for_list = list_items.clone();
-        let actual_count = items_for_list.len();
-        // 防御性校验: 如果 ListState 的 item_count 与实际不符, splice 修正
-        let state_count = lst.item_count();
-        if state_count != actual_count {
-            if state_count < actual_count {
-                lst.splice(state_count..state_count, actual_count - state_count);
+            let valid = auth_service::verify_cookie(&cookie).await.unwrap_or(false);
+            if valid {
+                // 加载首页
+                load_home_timeline(&app, &state).await;
             } else {
-                lst.splice(actual_count..state_count, 0);
+                app.emit("login-phase-changed", LoginPhasePayload::Loading {
+                    message: "Cookie 已过期, 请重新登录".into()
+                }).ok();
             }
         }
-        list(lst, move |ix, _window, _cx| { ... })
-```
-
-> 注: `lst.item_count()` 和 `lst.splice()` 是 GPUI `ListState` 的公开 API。
-
----
-
-## 修复三: 图片渲染失败
-
-### 3.1 问题分析
-
-截图中看到图片消息区域显示为空白/灰色块，而非预期的 "🖼" 占位图标。
-
-**根因**:
-1. `fids` 解析使用 `as_str()`，但 API 返回的是 JSON 数组 `[5312697042208502]`（`Value::Array`），所以 `as_str()` 永远返回 `None`，`fids` 为空。
-2. 当 `fids` 为空时，`media_type` 仍然是 `Image`（因为 `media_type=1`），进入 `render_image_bubble`。但该函数目前只渲染一个固定大小的灰色块 + 文字，在某些布局条件下可能被压缩不可见。
-
-### 3.2 修复方案
-
-#### 3.2.1 修复 fids 解析 — 正确处理 JSON array
-
-**文件**: `src/model/chat_service.rs`
-
-**位置 1**: `fetch_group_messages` 第 204-215 行
-
-**当前**:
-```rust
-let fids = m
-    .get("fids")
-    .and_then(|v| v.as_str())
-    .map(|s| {
-        s.trim_matches(|c| c == '[' || c == ']')
-            .split(',')
-            .filter(|s| !s.is_empty())
-            .map(|s| s.trim().to_string())
-            .collect::<Vec<_>>()
-    })
-    .unwrap_or_default();
-```
-
-**改为**:
-```rust
-let fids = m.get("fids")
-    .and_then(|v| {
-        // API 返回 JSON array: [5312697042208502]
-        if let Some(arr) = v.as_array() {
-            Some(arr.iter()
-                .filter_map(|item| {
-                    item.as_u64().map(|n| n.to_string())
-                        .or_else(|| item.as_str().map(|s| s.to_string()))
-                })
-                .collect::<Vec<_>>())
-        } else if let Some(s) = v.as_str() {
-            // 兼容字符串格式: "[123,456]"
-            Some(s.trim_matches(|c| c == '[' || c == ']')
-                .split(',')
-                .filter(|s| !s.is_empty())
-                .map(|s| s.trim().to_string())
-                .collect())
-        } else {
-            None
+        None => {
+            app.emit("login-phase-changed", LoginPhasePayload::Loading {
+                message: "请扫码登录".into()
+            }).ok();
         }
-    })
-    .unwrap_or_default();
-```
+    }
+    Ok(())
+}
 
-**位置 2**: `fetch_messages` (DM) 第 291-297 行
+/// 启动 QR 扫码登录流程
+#[tauri::command]
+pub async fn start_qr_login(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    // 对应 login_vm::start_login_flow (拆分为多步)
+    // 1. prepare_qr
+    // 2. emit WaitingScan 事件 (附带 base64 QR 图片)
+    // 3. 轮询循环 (spawn 后台任务)
+    // 4. 确认后 exchange_ticket → load_home_timeline
+    todo!()
+}
 
-**当前**:
-```rust
-let fids_str = m.get("fids").and_then(|v| v.as_str()).unwrap_or("");
-let fids = fids_str
-    .trim_matches(|c| c == '[' || c == ']')
-    .split(',')
-    .filter(|s| !s.is_empty())
-    .map(|s| s.trim().to_string())
-    .collect::<Vec<_>>();
-```
+/// 登出
+#[tauri::command]
+pub async fn logout(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    crate::infra::cookie_io::delete();
+    *state.phase.write().await = LoginPhase::CheckingCookie;
+    app.emit("login-phase-changed", LoginPhasePayload::CheckingCookie).ok();
+    Ok(())
+}
 
-**改为** (同样逻辑):
-```rust
-let fids = m.get("fids")
-    .and_then(|v| {
-        if let Some(arr) = v.as_array() {
-            Some(arr.iter()
-                .filter_map(|item| {
-                    item.as_u64().map(|n| n.to_string())
-                        .or_else(|| item.as_str().map(|s| s.to_string()))
-                })
-                .collect::<Vec<_>>())
-        } else if let Some(s) = v.as_str() {
-            Some(s.trim_matches(|c| c == '[' || c == ']')
-                .split(',')
-                .filter(|s| !s.is_empty())
-                .map(|s| s.trim().to_string())
-                .collect())
-        } else {
-            None
-        }
-    })
-    .unwrap_or_default();
-```
-
-#### 3.2.2 优化图片占位渲染 — 确保可见性
-
-**文件**: `src/view/widgets/message_bubble.rs` 第 115-135 行
-
-**当前**:
-```rust
-fn render_image_bubble(msg: &ChatMessage, _bg: Rgba, fg: Rgba) -> AnyElement {
-    div()
-        .px_3().py_2().rounded_lg().bg(_bg)
-        .child(
-            div().flex().flex_col().gap_1()
-                .child(
-                    div()
-                        .w(px(200.0)).h(px(120.0)).rounded_md()
-                        .bg(rgb(0x2a3a5a))
-                        .flex().items_center().justify_center()
-                        .text_size(px(24.0)).text_color(rgb(theme::CLR_MUTED))
-                        .child("🖼")
-                )
-                ...
-```
-
-**改为**:
-```rust
-fn render_image_bubble(msg: &ChatMessage, _bg: Rgba, fg: Rgba) -> AnyElement {
-    // 构建图片描述文本
-    let desc = if msg.fids.is_empty() {
-        "[图片]".to_string()
-    } else {
-        format!("[图片 x{}]", msg.fids.len())
-    };
-
-    div()
-        .px_3().py_2().rounded_lg().bg(_bg)
-        .child(
-            div().flex().flex_col().gap_1()
-                .child(
-                    div()
-                        .w(px(180.0))        // 稍微缩小避免撑破 max_w
-                        .h(px(100.0))
-                        .rounded_md()
-                        .bg(rgb(0x1e2e4e))   // 更深的背景色以便区分
-                        .border_1()
-                        .border_color(rgb(0x2a3a5a))
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .gap_1()
-                        .child(
-                            div().text_size(px(28.0)).child("🖼")
-                        )
-                        .child(
-                            div().text_size(px(11.0))
-                                .text_color(rgb(theme::CLR_MUTED))
-                                .child(desc)
-                        )
-                )
-                // 如果有附带文字且不是默认的"分享图片"，则显示
-                .when(!msg.text.is_empty() && msg.text != "分享图片", |d| {
-                    let t = msg.text.clone();
-                    d.child(
-                        div().text_size(px(13.0)).text_color(fg).child(t)
-                    )
-                })
-        )
-        .into_any_element()
+/// 内部辅助: 加载首页时间线
+async fn load_home_timeline(app: &AppHandle, state: &State<'_, AppState>) {
+    app.emit("login-phase-changed", LoginPhasePayload::FetchingHome).ok();
+    let (items, title, feed_list_id, since_id) = timeline_service::fetch_first_page().await;
+    // 更新 state
+    let mut tl = state.timeline.write().await;
+    tl.items = items;
+    tl.title = title.clone();
+    tl.since_id = since_id;
+    tl.feed_list_id = feed_list_id;
+    // 通知前端
+    app.emit("login-phase-changed", LoginPhasePayload::HomeLoaded {
+        item_count: tl.items.len(),
+        title,
+    }).ok();
 }
 ```
 
-**关键改动**:
-- 缩小图片占位尺寸 (180x100)，避免超出 `max_w(360px)` 气泡宽度
-- 添加 `border_1()` 边框使占位区域清晰可见
-- 显示图片数量信息 `[图片 x1]`
-- 使用 `.when()` 条件渲染文字，避免不必要的空 div
+#### 2.2 `commands/chat.rs` — 聊天命令
+
+替代 `chat_vm.rs`:
+
+```rust
+// src-tauri/src/commands/chat.rs
+
+/// 加载联系人列表
+#[tauri::command]
+pub async fn load_contacts(app: AppHandle, state: State<'_, AppState>) -> Result<Vec<ContactPayload>, String> {
+    let (contacts, my_info) = tokio::join!(
+        chat_service::fetch_contacts(),
+        chat_service::fetch_primary_info(),
+    );
+    // 更新 state 并返回
+    todo!()
+}
+
+/// 选中一个联系人，加载消息历史
+#[tauri::command]
+pub async fn select_contact(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    uid: String,
+    is_group: bool,
+) -> Result<Vec<ChatMessagePayload>, String> {
+    // 对应 chat_vm::select_contact
+    todo!()
+}
+
+/// 加载更早消息 (分页)
+#[tauri::command]
+pub async fn load_older_messages(
+    state: State<'_, AppState>,
+    uid: String,
+    is_group: bool,
+) -> Result<Vec<ChatMessagePayload>, String> {
+    // 对应 chat_vm::load_more_messages
+    todo!()
+}
+
+/// 发送消息
+#[tauri::command]
+pub async fn send_message(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    uid: String,
+    text: String,
+    is_group: bool,
+) -> Result<Option<ChatMessagePayload>, String> {
+    // 对应 chat_vm::send_message
+    todo!()
+}
+
+/// 获取表情列表
+#[tauri::command]
+pub async fn fetch_emotions(state: State<'_, AppState>) -> Result<Vec<EmotionPayload>, String> {
+    todo!()
+}
+```
+
+#### 2.3 `commands/timeline.rs` — 时间线命令
+
+替代 `root_vm::try_load_more`:
+
+```rust
+// src-tauri/src/commands/timeline.rs
+
+/// 获取当前时间线数据
+#[tauri::command]
+pub async fn get_timeline(state: State<'_, AppState>) -> Result<TimelinePayload, String> {
+    todo!()
+}
+
+/// 加载更多时间线 (下拉加载)
+#[tauri::command]
+pub async fn load_more_timeline(state: State<'_, AppState>) -> Result<TimelinePayload, String> {
+    // 对应 root_vm::try_load_more
+    todo!()
+}
+```
+
+#### 2.4 WebSocket 监听 → Tauri Event
+
+替代 `root_vm` 中的 `cx.spawn` + `rx.recv()`:
+
+```rust
+// src-tauri/src/commands/chat.rs
+
+/// 启动 WebSocket 长连接 (在登录成功后调用)
+#[tauri::command]
+pub async fn start_websocket(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let chat = state.chat_data.read().await;
+    let my_uid = chat.as_ref().map(|c| c.my_uid.clone()).unwrap_or_default();
+    drop(chat);
+
+    if my_uid.is_empty() { return Err("uid 不可用".into()); }
+
+    let mut rx = chat_service::start_ws(my_uid, /* handle */);
+
+    // 后台任务: 持续接收 WS 消息并 emit 事件
+    let app_clone = app.clone();
+    let state_inner = state.inner().clone();
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            // 1. 更新 state.chat_data
+            // 2. emit "new-message" 事件给前端
+            app_clone.emit("new-message", NewMessage { ... }).ok();
+            // 3. 播放提示音
+            if !is_self {
+                crate::infra::audio::play_notification();
+            }
+        }
+    });
+
+    Ok(())
+}
+```
+
+#### 2.5 Tauri 入口 `main.rs`
+
+```rust
+// src-tauri/src/main.rs
+mod commands;
+mod domain;
+mod events;
+mod infra;
+mod model;
+mod qr_login;
+mod state;
+#[macro_use]
+mod logger;
+
+use state::AppState;
+
+fn main() {
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider()
+    );
+
+    tauri::Builder::default()
+        .manage(AppState::new())
+        .invoke_handler(tauri::generate_handler![
+            commands::auth::check_saved_cookie,
+            commands::auth::start_qr_login,
+            commands::auth::logout,
+            commands::chat::load_contacts,
+            commands::chat::select_contact,
+            commands::chat::load_older_messages,
+            commands::chat::send_message,
+            commands::chat::fetch_emotions,
+            commands::chat::start_websocket,
+            commands::timeline::get_timeline,
+            commands::timeline::load_more_timeline,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+```
+
+#### 2.6 验收标准
+- [ ] 所有 `#[tauri::command]` 编译通过
+- [ ] 为每个 command 编写单元测试 (mock AppHandle)
+- [ ] `cargo test` 通过
 
 ---
 
-## 修复四: 滚轮无法触发加载更多消息
+### Phase 3: domain 层适配 (预计 0.5 天)
 
-### 4.1 问题分析
-
-当前"加载更早消息"功能仅有一个手动点击按钮 (`load-more-btn`)，没有滚轮滚动到顶部自动加载的逻辑。用户需要不断点击按钮，体验差。
-
-**根因**: `msg_list_state` 没有设置 `set_scroll_handler`，无法检测滚动到顶部的事件。
-
-### 4.2 修复方案
-
-#### 4.2.1 在 `chat_screen.rs` 的消息列表上设置 scroll handler
-
-**文件**: `src/view/screens/chat_screen.rs`
-
-在 `message_panel` 函数中，创建 list 之前，给 `msg_list_state` 设置 scroll handler:
-
-**在第 306 行 `.child(if !msgs.is_empty() {` 之前插入**:
+#### 3.1 为所有 domain 类型添加 Serialize/Deserialize
 
 ```rust
-// 设置滚动监听: 滚到顶部时自动加载更多
-if has_more {
-    if let Some(ref lst) = msg_list_state {
-        let uid_scroll = uid.clone();
-        let muid_scroll = my_uid.clone();
-        let mid_scroll = oldest_mid.clone().unwrap_or_default();
-        lst.set_scroll_handler(cx.listener(
-            move |this, event: &ListScrollEvent, _window, cx| {
-                // 当可见区域的起始索引 <= 2 时 (接近顶部), 自动加载更早消息
-                if event.visible_range.start <= 2 {
-                    if let Some(chat) = this.chat_data.as_ref() {
-                        if chat.has_more && !chat.messages_loading {
-                            if let Some(chat_mut) = this.chat_data.as_mut() {
-                                chat_mut.messages_loading = true;
-                            }
-                            chat_vm::load_more_messages(
-                                cx,
-                                &this.tokio_handle,
-                                uid_scroll.clone(),
-                                muid_scroll.clone(),
-                                is_group,
-                                mid_scroll.clone(),
-                            );
-                        }
-                    }
-                }
-            }
-        ));
+// domain/mod.rs — 所有结构体添加:
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Contact { ... }
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum LoginPhase { ... }
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ChatMessage { ... }
+
+// ... 所有 pub 类型
+```
+
+#### 3.2 注意事项
+- `LoginPhase::WaitingScan.qr_png_bytes` 改为 `qr_base64: Option<String>` (WebView 中用 base64 显示图片)
+- 或者保持 `Vec<u8>` 在后端, 在 event payload 中转为 base64
+
+#### 3.3 验收标准
+- [ ] 所有 domain 类型可以 `serde_json::to_string` 序列化
+- [ ] 编写测试验证序列化/反序列化往返一致
+
+---
+
+### Phase 4: 前端框架搭建 (预计 1 天)
+
+#### 4.1 项目初始化
+
+```bash
+# 前端依赖
+npm install vue@3 vue-router@4 pinia @tauri-apps/api
+npm install -D typescript vite @vitejs/plugin-vue tailwindcss autoprefixer
+npm install vue-virtual-scroller  # 虚拟滚动
+```
+
+#### 4.2 TypeScript 类型定义
+
+```typescript
+// src/types/index.ts — 与 domain/ 对应
+export interface Contact {
+  user_id: string;
+  screen_name: string;
+  avatar: string;
+  unread_count: number;
+  last_message: string;
+  last_time: string;
+  is_group: boolean;
+}
+
+export interface ChatMessage {
+  id: string;
+  sender_id: string;
+  sender_name: string;
+  sender_avatar: string;
+  text: string;
+  timestamp: number;
+  is_self: boolean;
+  msg_type: 'Normal' | 'System' | 'Recall' | { Other: number };
+  media_type: 'Text' | 'Image' | 'Quote' | { Other: number };
+  fids: string[];
+  role: number;
+}
+
+export interface TimelineItem {
+  user_name: string;
+  text: string;
+}
+
+export type LoginPhase =
+  | { type: 'CheckingCookie' }
+  | { type: 'Loading'; message: string }
+  | { type: 'WaitingScan'; status: string; qr_base64: string | null }
+  | { type: 'Exchanging'; message: string }
+  | { type: 'FetchingHome' }
+  | { type: 'HomeLoaded'; item_count: number; title: string }
+  | { type: 'Error'; message: string };
+```
+
+#### 4.3 Pinia Store 设计
+
+```typescript
+// src/stores/auth.ts
+export const useAuthStore = defineStore('auth', () => {
+  const phase = ref<LoginPhase>({ type: 'CheckingCookie' });
+  const isLoggedIn = computed(() => phase.value.type === 'HomeLoaded');
+
+  async function checkCookie() { await invoke('check_saved_cookie'); }
+  async function startQrLogin() { await invoke('start_qr_login'); }
+  async function logout() { await invoke('logout'); }
+
+  // 监听后端事件
+  function setupListeners() {
+    listen<LoginPhase>('login-phase-changed', (event) => {
+      phase.value = event.payload;
+    });
+  }
+
+  return { phase, isLoggedIn, checkCookie, startQrLogin, logout, setupListeners };
+});
+
+// src/stores/chat.ts
+export const useChatStore = defineStore('chat', () => {
+  const contacts = ref<Contact[]>([]);
+  const selectedUid = ref<string | null>(null);
+  const messages = ref<ChatMessage[]>([]);
+  const draftText = ref('');           // 纯前端状态
+  const showEmojiPanel = ref(false);   // 纯前端状态
+  const searchText = ref('');          // 纯前端状态
+
+  async function loadContacts() { ... }
+  async function selectContact(uid: string, isGroup: boolean) { ... }
+  async function sendMessage() { ... }
+  async function loadOlderMessages() { ... }
+
+  function setupListeners() {
+    listen<NewMessage>('new-message', (event) => {
+      // 追加消息、更新联系人预览
+    });
+  }
+
+  return { contacts, selectedUid, messages, draftText, ... };
+});
+```
+
+#### 4.4 路由配置
+
+```typescript
+// src/router/index.ts
+const routes = [
+  { path: '/login', component: LoginView },
+  { path: '/', component: () => import('@/views/HomeView.vue') },
+  { path: '/chat', component: () => import('@/views/ChatView.vue') },
+];
+```
+
+#### 4.5 验收标准
+- [ ] `npm run dev` 前端开发服务器启动
+- [ ] 基础路由跳转工作正常
+- [ ] Pinia store 可以调用 Tauri invoke (即使后端还是 todo)
+
+---
+
+### Phase 5: 前端视图实现 (预计 4-5 天)
+
+#### 5.1 视图对应关系
+
+| GPUI (旧) | Vue (新) | 功能 |
+|-----------|---------|------|
+| `view/app_shell.rs` | `App.vue` + `router` | 窗口骨架 + 路由 |
+| `view/screens/root_screen.rs` | `App.vue` (tabs + body) | Tab 栏 + 内容路由 |
+| `view/screens/login_screen.rs` | `views/LoginView.vue` | 登录界面 |
+| `view/screens/home_screen.rs` | `views/HomeView.vue` | 时间线首页 |
+| `view/screens/chat_screen.rs` | `views/ChatView.vue` | 聊天界面 |
+| `view/widgets/header_bar.rs` | `components/HeaderBar.vue` | 顶部状态栏 |
+| `view/widgets/contact_card.rs` | `components/ContactCard.vue` | 联系人卡片 |
+| `view/widgets/message_bubble.rs` | `components/MessageBubble.vue` | 消息气泡 |
+| `view/widgets/timeline_card.rs` | `components/TimelineCard.vue` | 时间线卡片 |
+| `view/widgets/qr_display.rs` | `components/QrDisplay.vue` | QR 码显示 |
+| `view/widgets/emoji_panel.rs` | `components/EmojiPanel.vue` | 表情面板 |
+| `view/widgets/member_sidebar.rs` | `components/MemberSidebar.vue` | 群成员侧栏 |
+| `view/widgets/centered_msg.rs` | `components/CenteredMsg.vue` | 居中提示文字 |
+| `view/theme.rs` | `styles/theme.css` | 主题色值 |
+
+#### 5.2 关键组件实现要点
+
+**LoginView.vue:**
+- 监听 `login-phase-changed` 事件切换 UI 状态
+- QR 图片用 `<img :src="'data:image/png;base64,' + qrBase64" />`
+- 状态提示文字响应式更新
+
+**ChatView.vue (最复杂):**
+- 联系人列表: 虚拟滚动 (`vue-virtual-scroller`)
+- 消息列表: 虚拟滚动 + 滚动到底部 + 向上滚动加载历史
+- 输入框: `v-model` + Ctrl+Enter 发送
+- WebSocket 消息实时追加
+
+**HomeView.vue:**
+- 时间线卡片列表: 虚拟滚动
+- 无限滚动加载更多
+
+#### 5.3 主题迁移
+
+```css
+/* src/styles/theme.css — 对应 view/theme.rs */
+:root {
+  --clr-bg: #0d1b2a;
+  --clr-text: #e0e6ed;
+  --clr-accent: #4fc3f7;
+  --clr-muted: #5a7a9a;
+  --clr-card: #1b2838;
+  --clr-surface: #152238;
+  /* ... */
+}
+```
+
+#### 5.4 验收标准
+- [ ] 登录页: QR 码显示、状态切换、自动跳转
+- [ ] 首页: 时间线列表渲染、无限滚动
+- [ ] 聊天: 联系人列表、消息列表、发送消息、表情面板
+- [ ] WebSocket: 实时收到新消息
+
+---
+
+### Phase 6: 集成测试 & 清理 (预计 1 天)
+
+#### 6.1 端到端验证
+
+- [ ] 冷启动: 无 Cookie → QR 扫码 → 首页加载
+- [ ] 热启动: 有 Cookie → 自动登录 → 首页加载
+- [ ] 聊天: 选择联系人 → 查看历史 → 发送消息 → 收到推送
+- [ ] 登出: 点击登出 → 回到扫码界面
+- [ ] 时间线: 滚动加载更多
+
+#### 6.2 清理旧代码
+
+- [ ] 删除 `src/view/` 目录 (全部 GPUI 渲染代码)
+- [ ] 删除 `src/viewmodel/` 目录 (已被 commands/ 替代)
+- [ ] 从 Cargo.toml 移除 `gpui`、`wry`、`tao` 依赖
+- [ ] 删除 `build.rs` (如果只是为 gpui 服务的)
+- [ ] 更新 `main.rs` 入口
+
+#### 6.3 验收标准
+- [ ] 无残留 GPUI 代码
+- [ ] `cargo clippy` 无 warning
+- [ ] `npm run build` 前端构建通过
+- [ ] `cargo tauri build` 打包成功
+
+---
+
+## 五、风险与注意事项
+
+### 5.1 model 层的 `block_on` 调用
+
+当前 model 层的函数是 `async fn`，但在 viewmodel 中通过 `handle.block_on()` 调用。
+迁移到 Tauri 后，`#[tauri::command]` 本身支持 `async`，可以直接 `.await`，不再需要 `block_on`。
+
+**变化**:
+```rust
+// 旧: handle.block_on(auth_service::verify_cookie(&cookie))
+// 新: auth_service::verify_cookie(&cookie).await
+```
+
+### 5.2 QR 轮询机制
+
+GPUI 中用 `Timer::after(Duration::from_secs(1)).await` + 循环实现。
+Tauri 中改为 `tokio::time::sleep` + `app.emit` 通知前端进度:
+
+```rust
+loop {
+    let status = auth_service::poll_qr(&login).await;
+    match status { ... }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+}
+```
+
+### 5.3 image crate 用途
+
+当前 `image = "0.25"` 仅用于 QR 码 PNG 解码 (生成 GPUI 可用的 RGBA 数据)。
+迁移后，QR 码直接以 base64 PNG 传给前端 `<img>` 标签，**可能不再需要** image crate。
+
+### 5.4 CLI 模式保留
+
+`cli/` 模块 (终端 QR 登录、Cookie 登录) 与 UI 无关，保持不变。
+可以在 `main.rs` 中用命令行参数判断是否走 CLI 模式:
+
+```rust
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(|s| s.as_str()) {
+        Some("cookie") => { /* CLI cookie login */ }
+        Some("http") => { /* CLI QR login */ }
+        _ => { /* Tauri GUI mode */ }
     }
 }
 ```
 
-#### 4.2.2 使用 `messages_loading` 防止重复触发
+### 5.5 音频播放
 
-`ChatData` 中已有 `messages_loading: bool` 字段。需确保在加载完成后重置:
+`infra/audio.rs` 使用 `rodio`，与 UI 框架无关，可以直接在 Tauri 后端的 WS 消息处理中调用。
 
-**文件**: `src/viewmodel/chat_vm.rs` `load_more_messages` 函数 (第 130-149 行)
+### 5.6 跨平台注意
 
-**在 `this.update(...)` 闭包内，添加重置**:
-
-**当前** (约第 131 行):
-```rust
-this.update(&mut cx, |v, cx| {
-    if let Some(chat) = v.chat_data.as_mut() {
-        let count = older.len();
-        if count > 0 {
-            ...
-        } else {
-            chat.has_more = false;
-        }
-    }
-    cx.notify();
-}).ok();
-```
-
-**改为**:
-```rust
-this.update(&mut cx, |v, cx| {
-    if let Some(chat) = v.chat_data.as_mut() {
-        chat.messages_loading = false;  // ← 新增: 重置加载状态
-        let count = older.len();
-        if count > 0 {
-            chat.oldest_mid = older.first().map(|m| m.id.clone());
-            chat.has_more = count >= 30;
-            let mut all = older;
-            all.append(&mut chat.messages);
-            chat.messages = all;
-            chat.msg_list_state = Some(rebuild_msg_list_state(&chat.messages, ListAlignment::Top));
-            log_info!("[chat_vm] 加载更早 {} 条消息, 总计 {} 条, has_more={}", count, chat.messages.len(), chat.has_more);
-        } else {
-            chat.has_more = false;
-            log_info!("[chat_vm] 没有更早的消息了");
-        }
-    }
-    cx.notify();
-}).ok();
-```
-
-#### 4.2.3 scroll handler 中的 `oldest_mid` 需要动态获取
-
-**问题**: 上面 4.2.1 中 `mid_scroll` 在闭包创建时就被捕获了，但 `oldest_mid` 在加载更多消息后会更新。闭包中使用的是旧值。
-
-**修复**: 在 scroll handler 内部从 `this.chat_data` 实时读取 `oldest_mid`:
-
-```rust
-lst.set_scroll_handler(cx.listener(
-    move |this, event: &ListScrollEvent, _window, cx| {
-        if event.visible_range.start <= 2 {
-            if let Some(chat) = this.chat_data.as_ref() {
-                if chat.has_more && !chat.messages_loading {
-                    if let Some(mid) = chat.oldest_mid.clone() {
-                        let uid_s = chat.selected_uid.clone().unwrap_or_default();
-                        let muid_s = chat.my_uid.clone();
-                        let is_group_s = is_group;
-                        // 标记加载中
-                        if let Some(chat_mut) = this.chat_data.as_mut() {
-                            chat_mut.messages_loading = true;
-                        }
-                        chat_vm::load_more_messages(
-                            cx, &this.tokio_handle,
-                            uid_s, muid_s, is_group_s, mid,
-                        );
-                    }
-                }
-            }
-        }
-    }
-));
-```
-
-> **注意**: `cx.listener` 闭包的第一个参数 `this` 是 `&mut AppRoot`，可以直接访问最新的 `chat_data`。不需要提前捕获 `uid`/`oldest_mid`。
-
-#### 4.2.4 保留手动按钮作为备选
-
-保留现有的 "▲ 加载更早消息" 按钮不变，作为滚轮触发失败时的手动备选。但可以将文案改为更友好的提示:
-
-```rust
-.child("▲ 滚动到顶部自动加载 / 点击加载更早消息")
-```
+- Tauri 2.x 在 Linux 上使用 WebKitGTK，需确保开发环境安装了相关依赖
+- 字体渲染: 原 GPUI 指定 "Microsoft YaHei"，Web 中可用 `font-family` CSS 自适应
 
 ---
 
-## 附加修复: 防止 review.md 中的 P0 panic
+## 六、工作量总结
 
-以下是 `review.md` 中标记为 P0 的 panic 问题，应与上述 4 个修复一并处理:
+| Phase | 内容 | 预估工时 | 依赖 |
+|-------|------|---------|------|
+| 0 | 项目初始化 + 模块搬迁 | 1 天 | 无 |
+| 1 | AppState + Events 定义 | 2 天 | Phase 0 |
+| 2 | Tauri Commands 实现 | 3 天 | Phase 1 |
+| 3 | domain 序列化适配 | 0.5 天 | Phase 0 |
+| 4 | 前端框架搭建 | 1 天 | Phase 0 |
+| 5 | 前端视图实现 | 4-5 天 | Phase 2, 3, 4 |
+| 6 | 集成测试 + 清理 | 1 天 | Phase 5 |
+| **总计** | | **12-13 天** | |
 
-### A. 中文字符串切片 panic
-
-**文件**: `src/model/chat_service.rs` 第 375 行和第 438 行
-
-**当前**:
-```rust
-&text[..text.len().min(20)]
-```
-
-**改为**:
-```rust
-&text.chars().take(20).collect::<String>()
-```
-
-**或者使用辅助函数** (在 `chat_service.rs` 底部添加):
-```rust
-/// 安全截取字符串前 N 个字符 (UTF-8 安全)
-fn truncate_chars(s: &str, max_chars: usize) -> String {
-    s.chars().take(max_chars).collect()
-}
-```
-
-然后替换:
-```rust
-log_info!("[chat] 发送消息: uid={}, text={}...", uid, truncate_chars(text, 20));
-log_info!("[chat] Group send: gid={}, text={}...", gid, truncate_chars(text, 20));
-```
-
-### B. tokio::spawn 在非 runtime 上下文中的 panic
-
-**文件**: `src/view/screens/chat_screen.rs` 第 381 行
-
-**当前**:
-```rust
-tokio::spawn(async move { ... });
-```
-
-**改为** (使用 `cx.spawn` + `handle.block_on` 正确模式):
-```rust
-// 在 on_click listener 中, 将加载表情改为 cx.spawn 模式
-let handle = this.tokio_handle.clone();
-cx.spawn(|this_weak: WeakEntity<AppRoot>, cx: &mut AsyncApp| {
-    let mut cx = cx.clone();
-    async move {
-        let emotions = handle.block_on(
-            crate::model::chat_service::fetch_emotions()
-        );
-        this_weak.update(&mut cx, |v, cx| {
-            if let Some(chat) = v.chat_data.as_mut() {
-                chat.emotions = emotions;
-            }
-            cx.notify();
-        }).ok();
-    }
-}).detach();
-```
-
-**文件**: `src/viewmodel/chat_vm.rs` 第 108 行和第 115 行
-
-**当前**:
-```rust
-tokio::spawn(async move { ... });
-```
-
-**改为**:
-```rust
-handle.spawn(async move { ... });
-```
+**可并行**: Phase 3 + Phase 4 可与 Phase 1-2 并行开发。
 
 ---
 
-## 修改文件汇总
+## 七、迁移策略
 
-| 文件 | 修复内容 |
-|------|---------|
-| `src/view/widgets/contact_card.rs` | 修复一: 未读角标固定最小尺寸 + 居中 |
-| `src/viewmodel/chat_vm.rs` | 修复二: 新增 `compute_list_item_count` + `rebuild_msg_list_state`，修改 `select_contact`/`load_more_messages`/`send_message` |
-| `src/viewmodel/root_vm.rs` | 修复二: `handle_ws_message` 使用 `rebuild_msg_list_state` |
-| `src/view/screens/chat_screen.rs` | 修复二(防御校验) + 修复四(scroll handler) + 附加B(tokio::spawn) |
-| `src/model/chat_service.rs` | 修复三(fids 解析) + 附加A(中文切片) |
-| `src/view/widgets/message_bubble.rs` | 修复三: 优化图片占位渲染 |
+采用 **平行开发** 而非逐步替换:
 
----
+1. 在项目根目录新建 `src-tauri/` 和前端 `src/` (Tauri 标准结构)
+2. 旧的 `src/` 重命名为 `src-gpui/` 保留作为参考
+3. 两套代码共存期间，用 git branch 隔离
+4. 新版本功能对齐后，删除旧代码，合入主分支
 
-## 验证方法
-
-1. **角标修复**: 打开聊天界面，确认未读数为 1-3 位数时角标保持圆形/短胶囊，不再被拉长
-2. **消息覆盖**: 进入有大量消息的群聊，确认消息之间不再重叠，滚动流畅
-3. **图片渲染**: 进入有图片消息的聊天，确认显示 "🖼 [图片 x1]" 占位，不再是空白块
-4. **滚轮加载**: 在消息列表中向上滚动到顶部，确认自动触发加载更早消息（观察日志 `[chat_vm] 加载更早`）
+这样做的好处:
+- 旧版本随时可用 (切回 branch)
+- 不会因为半成品导致项目不可用
+- 可以逐个功能对比验证

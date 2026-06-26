@@ -1,209 +1,385 @@
-# 微博 PC 客户端 — UI 层重构计划: GPUI → Tauri
+# 微博 PC 客户端 — UI 层重构计划: VMContext Trait + Workspace 多模块架构
 
-> 目标: 将 UI 渲染层从 GPUI 迁移到 Tauri (WebView)，保留底层业务逻辑不变。
-
----
-
-## 一、现状分析
-
-### 1.1 当前模块结构
-
-```
-src/
-├── domain/mod.rs          ← 纯数据结构 (零依赖)
-├── infra/                 ← 基础设施 (HTTP, WS, Cookie, Audio, Config)
-├── model/                 ← 业务服务 (auth_service, chat_service, timeline_service)
-├── viewmodel/             ← 状态机 (root_vm, login_vm, home_vm, chat_vm)
-├── view/                  ← GPUI 渲染 (screens, widgets, theme, app_shell)
-├── cli/                   ← CLI 模式 (QR/Cookie 登录)
-├── legacy/                ← 遗留代码 (WebView login, proxy)
-├── qr_login.rs            ← QR 登录协议
-├── logger.rs              ← 日志宏
-└── main.rs                ← 入口
-```
-
-### 1.2 GPUI 耦合清单
-
-| 模块 | GPUI 依赖项 | 耦合程度 |
-|------|------------|---------|
-| `view/` (全部 11 个文件) | `div()`, `list()`, `Render`, `IntoElement`, `AnyElement`, `px()`, `rgb()`, 事件系统 | 完全耦合 |
-| `viewmodel/root_vm.rs` | `Entity<AppRoot>`, `Context<Self>`, `Render` trait, `ListState`, `cx.spawn`, `cx.notify`, `WeakEntity` | 重度耦合 |
-| `viewmodel/login_vm.rs` | `WeakEntity`, `AsyncApp`, `cx.spawn`, `cx.notify`, `Timer::after` | 重度耦合 |
-| `viewmodel/home_vm.rs` | `WeakEntity`, `AsyncApp`, `cx.spawn`, `cx.notify`, `ListState`, `Timer::after` | 重度耦合 |
-| `viewmodel/chat_vm.rs` | `WeakEntity`, `AsyncApp`, `cx.spawn`, `cx.notify`, `ListState`, `ListAlignment`, `FocusHandle` | 重度耦合 |
-| `view/app_shell.rs` | `Application::new()`, `WindowOptions`, `cx.open_window` | 完全耦合 |
-| `domain/` | 无 | 无耦合 ✅ |
-| `infra/` | 无 | 无耦合 ✅ |
-| `model/` | 无 | 无耦合 ✅ |
-| `cli/` | 无 | 无耦合 ✅ |
+> 目标: 通过 VMContext trait 抽象将 ViewModel 与 UI 框架完全解耦，采用 Rust workspace 多 crate 架构，
+> 使得 UI 层可以自由切换 (当前从 GPUI → Tauri)，而 ViewModel 及以下各层零改动。
 
 ---
 
-## 二、目标架构
+## 一、架构设计总览
+
+### 1.1 目标依赖关系
 
 ```
-weibo/
-├── src-tauri/                    ← Tauri Rust 后端
-│   ├── Cargo.toml
-│   ├── tauri.conf.json
-│   ├── src/
-│   │   ├── main.rs              ← Tauri 入口 (替代 GPUI Application)
-│   │   ├── state.rs             ← AppState (替代 AppRoot Entity)
-│   │   ├── commands/            ← Tauri Commands (替代 viewmodel/)
-│   │   │   ├── mod.rs
-│   │   │   ├── auth.rs          ← 登录相关命令
-│   │   │   ├── chat.rs          ← 聊天相关命令
-│   │   │   └── timeline.rs      ← 时间线相关命令
-│   │   ├── events.rs            ← Tauri Events 定义 (替代 cx.notify)
-│   │   ├── domain/              ← 原样搬入 + 加 Serialize
-│   │   │   └── mod.rs
-│   │   ├── infra/               ← 原样搬入
-│   │   │   ├── mod.rs
-│   │   │   ├── http_client.rs
-│   │   │   ├── ws_client.rs
-│   │   │   ├── cookie_io.rs
-│   │   │   ├── audio.rs
-│   │   │   ├── config.rs
-│   │   │   └── logger.rs
-│   │   ├── model/               ← 原样搬入
-│   │   │   ├── mod.rs
-│   │   │   ├── auth_service.rs
-│   │   │   ├── chat_service.rs
-│   │   │   └── timeline_service.rs
-│   │   ├── cli/                 ← 原样搬入
-│   │   └── qr_login.rs         ← 原样搬入
-│   └── icons/
-├── src/                          ← 前端 (WebView)
+weibo-tauri (bin)                weibo-cli (bin, 可选)
+    │                                │
+    │ impl VMContext for Tauri       │ 不走 UI
+    ▼                                ▼
+weibo-viewmodel (lib)           weibo-model (lib)
+    │                                │
+    │ 依赖 trait, 不依赖具体框架      │
+    ▼                                ▼
+weibo-model (lib)               weibo-infra (lib)
+    │                                │
+    ▼                                ▼
+weibo-infra (lib)               weibo-domain (lib)
+    │
+    ▼
+weibo-domain (lib)
+```
+
+**核心原则**: `weibo-viewmodel` 的 `Cargo.toml` 中 **不出现** `gpui`、`tauri` 或任何 UI 框架依赖。
+
+### 1.2 Workspace 目录结构
+
+```
+weibo-rs/                              ← workspace 根目录
+├── Cargo.toml                         ← workspace 定义
+├── crates/
+│   ├── weibo-domain/                  ← 纯数据模型 (零外部依赖)
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── chat.rs               ← Contact, ChatMessage, Emotion, GroupInfo
+│   │       ├── timeline.rs           ← TimelineItem
+│   │       ├── auth.rs               ← LoginPhase, CookieData, QrStatus
+│   │       ├── tabs.rs               ← ActiveTab
+│   │       └── error.rs              ← AppError
+│   │
+│   ├── weibo-infra/                   ← 基础设施 (HTTP, WS, Cookie, Audio)
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── http_client.rs
+│   │       ├── ws_client.rs
+│   │       ├── cookie_io.rs
+│   │       ├── audio.rs
+│   │       ├── config.rs
+│   │       └── logger.rs
+│   │
+│   ├── weibo-model/                   ← 业务服务层
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── auth_service.rs
+│   │       ├── chat_service.rs
+│   │       ├── timeline_service.rs
+│   │       └── qr_login.rs
+│   │
+│   ├── weibo-viewmodel/               ← ViewModel (纯逻辑 + VMContext trait)
+│   │   ├── Cargo.toml                 ← 仅依赖 weibo-domain, weibo-model, tokio
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── context.rs             ← VMContext trait 定义
+│   │       ├── app_state.rs           ← AppState (纯数据状态)
+│   │       ├── login_vm.rs            ← 登录流程逻辑
+│   │       ├── home_vm.rs             ← 首页逻辑
+│   │       └── chat_vm.rs             ← 聊天逻辑
+│   │
+│   └── weibo-tauri/                   ← Tauri 应用 (binary + VMContext 实现)
+│       ├── Cargo.toml                 ← 依赖 tauri, weibo-viewmodel, weibo-model 等
+│       ├── tauri.conf.json
+│       ├── build.rs
+│       ├── icons/
+│       └── src/
+│           ├── main.rs                ← Tauri 入口
+│           ├── tauri_context.rs       ← impl VMContext for Tauri
+│           ├── commands/              ← Tauri IPC commands (薄包装)
+│           │   ├── mod.rs
+│           │   ├── auth.rs
+│           │   ├── chat.rs
+│           │   └── timeline.rs
+│           └── events.rs              ← 事件序列化定义
+│
+├── frontend/                          ← 前端 (Vue 3 + TypeScript)
+│   ├── package.json
+│   ├── vite.config.ts
+│   ├── tsconfig.json
 │   ├── index.html
-│   ├── main.ts                  ← 前端入口
-│   ├── App.vue                  ← 根组件
-│   ├── router/                  ← 路由 (login / home / chat)
-│   ├── stores/                  ← Pinia 状态管理 (替代 viewmodel 前端部分)
-│   │   ├── auth.ts
-│   │   ├── chat.ts
-│   │   └── timeline.ts
-│   ├── views/                   ← 页面 (替代 view/screens/)
-│   │   ├── LoginView.vue
-│   │   ├── HomeView.vue
-│   │   └── ChatView.vue
-│   ├── components/              ← 组件 (替代 view/widgets/)
-│   │   ├── HeaderBar.vue
-│   │   ├── ContactCard.vue
-│   │   ├── MessageBubble.vue
-│   │   ├── TimelineCard.vue
-│   │   ├── QrDisplay.vue
-│   │   ├── EmojiPanel.vue
-│   │   └── MemberSidebar.vue
-│   ├── styles/                  ← 样式 (替代 view/theme.rs)
-│   │   └── theme.css
-│   └── types/                   ← TypeScript 类型定义 (对应 domain/)
-│       └── index.ts
-├── package.json
-├── vite.config.ts
-└── tsconfig.json
+│   └── src/
+│       ├── main.ts
+│       ├── App.vue
+│       ├── router/
+│       ├── stores/
+│       ├── views/
+│       ├── components/
+│       ├── styles/
+│       └── types/
+│
+├── CLAUDE.md
+└── README.md
 ```
 
 ---
 
-## 三、技术选型
+## 二、VMContext Trait 详细设计
 
-| 层面 | 选择 | 理由 |
+### 2.1 Trait 定义
+
+```rust
+// crates/weibo-viewmodel/src/context.rs
+
+use std::future::Future;
+use std::pin::Pin;
+
+/// ViewModel 对外界执行环境的唯一抽象。
+///
+/// 职责:
+///   1. 通知 UI 层状态变更 (替代 gpui::cx.notify())
+///   2. 调度异步任务并在完成时回写状态 (替代 gpui::cx.spawn + WeakEntity)
+///   3. 延时等待 (替代 gpui::Timer::after)
+///
+/// 不同 UI 框架提供各自的实现:
+///   - GPUI: WeakEntity + AsyncApp
+///   - Tauri: AppHandle + emit
+///   - 测试: MockContext (同步执行，方便断言)
+pub trait VMContext: Send + Sync + 'static {
+    /// 通知 UI 层: 状态已变更，需要刷新渲染。
+    ///
+    /// GPUI 实现: cx.notify()
+    /// Tauri 实现: app.emit("state-changed", payload)
+    fn notify(&self);
+
+    /// 调度一个异步任务。
+    ///
+    /// 任务在后台执行，完成后通过 `on_done` 回调更新 ViewModel 状态。
+    /// 实现者负责:
+    ///   1. spawn 异步任务
+    ///   2. 任务完成时获取 ViewModel 的可变引用
+    ///   3. 调用 on_done 更新状态
+    ///   4. 自动调用 notify()
+    ///
+    /// 类型约束:
+    ///   - F: 异步操作本身 (如网络请求)
+    ///   - T: 异步操作的返回值
+    ///   - C: 状态更新回调
+    fn spawn_task<F, T, C>(&self, task: F, on_done: C)
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+        C: FnOnce(&mut dyn VMState, T) + Send + 'static;
+
+    /// 调度一个延时后执行的回调。
+    ///
+    /// 用于: QR 轮询间隔、加载动画延迟等。
+    fn schedule_after<C>(&self, millis: u64, callback: C)
+    where
+        C: FnOnce(&mut dyn VMState) + Send + 'static;
+}
+
+/// ViewModel 状态的抽象引用 (用于 on_done 回调中的类型擦除)。
+///
+/// 让 trait 方法不需要在签名中携带具体的 AppState 泛型。
+/// 实现者将 &mut AppState downcast 为 &mut dyn VMState。
+pub trait VMState: Send {
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+}
+```
+
+### 2.2 为什么引入 `VMState` trait
+
+问题: 如果 `spawn_task` 的回调签名是 `FnOnce(&mut AppState, T)`，那 `VMContext` trait 就必须携带泛型 `<S>` 或关联类型，导致无法做 trait object。
+
+解决: 引入 `VMState` trait 做类型擦除，回调中用 `downcast_mut` 取回具体类型:
+
+```rust
+impl VMState for AppState {
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+}
+
+// ViewModel 中使用:
+ctx.spawn_task(
+    async { auth_service::prepare_qr().await },
+    |state, result| {
+        let app = state.as_any_mut().downcast_mut::<AppState>().unwrap();
+        app.phase = LoginPhase::WaitingScan { ... };
+    },
+);
+```
+
+### 2.3 替代方案: 泛型 VMContext (无类型擦除)
+
+如果不想用 downcast，可以让 trait 带关联类型:
+
+```rust
+pub trait VMContext {
+    type State;
+
+    fn notify(&self);
+    fn spawn_task<F, T, C>(&self, task: F, on_done: C)
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+        C: FnOnce(&mut Self::State, T) + Send + 'static;
+}
+```
+
+**权衡**:
+| 方案 | 优点 | 缺点 |
 |------|------|------|
-| 桌面框架 | **Tauri 2.x** | Rust 后端、WebView 渲染、体积小、跨平台 |
-| 前端框架 | **Vue 3 + TypeScript** | 组合式 API 适合状态管理、生态丰富、上手快 |
-| 构建工具 | **Vite** | 快速 HMR、Tauri 官方推荐 |
-| 状态管理 | **Pinia** | Vue 3 官方推荐、TypeScript 友好 |
-| UI 组件库 | **不使用** (手写 CSS) | 保持轻量、设计还原度高 |
-| 虚拟滚动 | **vue-virtual-scroller** 或 **@tanstack/vue-virtual** | 替代 GPUI ListState |
-| CSS 方案 | **Tailwind CSS** | 原子类方式类似 GPUI 的 `.flex().px_4()` 风格 |
+| `VMState` 类型擦除 | 可做 `dyn VMContext`, 灵活 | 需要 downcast, 运行时有微小开销 |
+| 关联类型 `type State` | 编译期安全, 无 downcast | 不能做 trait object, 泛型传染 |
+
+**推荐**: 对于本项目，只有一个 `AppState`，用 **关联类型** 更简洁安全。
+
+### 2.4 最终推荐签名 (关联类型版)
+
+```rust
+// crates/weibo-viewmodel/src/context.rs
+
+pub trait VMContext: Send + Sync + 'static {
+    type State: Send + 'static;
+
+    /// 通知 UI 状态变更
+    fn notify(&self);
+
+    /// 调度异步任务, 完成后回调更新状态
+    fn spawn_task<F, T, C>(&self, task: F, on_done: C)
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+        C: FnOnce(&mut Self::State, T) + Send + 'static;
+
+    /// 延时后回调
+    fn schedule_after<C>(&self, millis: u64, callback: C)
+    where
+        C: FnOnce(&mut Self::State) + Send + 'static;
+}
+```
 
 ---
 
-## 四、分阶段实施计划
+## 三、各 Crate 详细设计
 
-### Phase 0: 项目初始化 (预计 1 天)
+### 3.1 `weibo-domain` — 纯数据模型
 
-#### 0.1 创建 Tauri 项目骨架
-
-```bash
-# 在项目根目录
-npm create tauri-app@latest . -- --template vue-ts
-```
-
-#### 0.2 迁移无耦合模块
-
-将以下模块原样复制到 `src-tauri/src/`:
-- `domain/mod.rs`
-- `infra/` (全部 6 个文件)
-- `model/` (全部 3 个文件)
-- `cli/` (全部)
-- `qr_login.rs`
-- `logger.rs`
-
-#### 0.3 配置 Cargo.toml
+**Cargo.toml 依赖**: 仅 `serde` (序列化)
 
 ```toml
 [package]
-name = "weibo"
-version = "0.2.0"
+name = "weibo-domain"
+version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
-tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["full"] }
-
-# 保留原有业务依赖
-reqwest = { version = "0.12", features = ["cookies", "json"] }
-anyhow = "1"
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
-futures-util = "0.3"
-base64 = "0.22"
-rsa = "0.9"
-rand = "0.8"
-hex = "0.4"
-url = "2"
-aes = "0.8"
-cbc = "0.1"
-sha2 = "0.10"
-image = "0.25"
-rodio = "0.19"
-
-# 移除 gpui, wry, tao
 ```
 
-#### 0.4 验收标准
-- [ ] `cargo build` (src-tauri) 编译通过
-- [ ] `npm run tauri dev` 能打开空白窗口
-- [ ] domain/infra/model 模块编译无报错
+**改动要点**:
+- 从当前 `src/domain/mod.rs` 直接搬入
+- 所有类型添加 `#[derive(Serialize, Deserialize)]`
+- `LoginPhase` 中的 `qr_png_bytes: Option<Vec<u8>>` 保留 (序列化时前端用 base64)
+- 将 `QrStatus` 从 `qr_login.rs` 搬入 domain (它是纯数据枚举)
+
+**文件拆分**:
+
+| 当前位置 | 新位置 | 内容 |
+|---|---|---|
+| `domain/mod.rs` 第 10-14 行 | `domain/tabs.rs` | `ActiveTab` |
+| `domain/mod.rs` 第 20-172 行 | `domain/chat.rs` | `Contact`, `MsgType`, `MediaType`, `ChatMessage`, `Emotion`, `GroupInfo`, `GroupMember` |
+| `domain/mod.rs` 第 136-142 行 | `domain/timeline.rs` | `TimelineItem` |
+| `domain/mod.rs` 第 148-186 行 | `domain/auth.rs` | `LoginPhase`, `CookieData` |
+| `domain/mod.rs` 第 193-228 行 | `domain/error.rs` | `AppError` |
+| `qr_login.rs` 中的 `QrStatus` | `domain/auth.rs` | `QrStatus` |
 
 ---
 
-### Phase 1: 后端状态层重构 (预计 2 天)
+### 3.2 `weibo-infra` — 基础设施
 
-#### 1.1 创建 `state.rs` — 全局应用状态
+**Cargo.toml 依赖**: `reqwest`, `tokio-tungstenite`, `rodio`, `serde_json`, `weibo-domain`
 
-替代 GPUI 的 `Entity<AppRoot>`，使用 `Arc<RwLock<>>` 管理共享状态:
+```toml
+[package]
+name = "weibo-infra"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+weibo-domain = { path = "../weibo-domain" }
+reqwest = { version = "0.12", features = ["cookies", "json"] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+serde_json = "1"
+rodio = "0.19"
+anyhow = "1"
+```
+
+**改动要点**:
+- 从当前 `src/infra/` 原样搬入，无逻辑修改
+- `ws_client.rs` 中的 `WsMessage` 保持在 infra 层 (它是传输层协议结构)
+- 若 `logger.rs` 使用了宏导出 (`#[macro_export]`)，需调整跨 crate 宏引用方式
+
+---
+
+### 3.3 `weibo-model` — 业务服务
+
+**Cargo.toml 依赖**: `weibo-domain`, `weibo-infra`, `anyhow`, `serde_json`
+
+```toml
+[package]
+name = "weibo-model"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+weibo-domain = { path = "../weibo-domain" }
+weibo-infra = { path = "../weibo-infra" }
+anyhow = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+```
+
+**改动要点**:
+- 从当前 `src/model/` 原样搬入
+- `qr_login.rs` 中的协议逻辑搬入此 crate (它是业务逻辑，不是数据模型)
+- 只需将 `use crate::infra::` 改为 `use weibo_infra::`
+- 将 `use crate::domain::` 改为 `use weibo_domain::`
+- 所有函数保持 `pub async fn` 签名不变
+
+---
+
+### 3.4 `weibo-viewmodel` — 核心: ViewModel + Trait
+
+**Cargo.toml 依赖**: `weibo-domain`, `weibo-model`, `tokio` (仅 sync feature)
+
+```toml
+[package]
+name = "weibo-viewmodel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+weibo-domain = { path = "../weibo-domain" }
+weibo-model = { path = "../weibo-model" }
+
+# 注意: 不依赖任何 UI 框架!
+# 仅需 tokio 的 mpsc channel (可选, 用于 WS 消息转发)
+tokio = { version = "1", features = ["sync"] }
+```
+
+**注意**: **没有** `gpui`、**没有** `tauri`。
+
+#### 3.4.1 `app_state.rs` — 纯状态容器
+
+从 `root_vm.rs` 的 `AppRoot` 和 `chat_vm.rs` 的 `ChatData` 中提取纯数据:
 
 ```rust
-// src-tauri/src/state.rs
-use tokio::sync::RwLock;
-use crate::domain::*;
+// crates/weibo-viewmodel/src/app_state.rs
 
-/// 全局应用状态 (Tauri managed state)
+use weibo_domain::*;
+
+/// 应用全局状态 (纯数据，不含任何 UI 框架类型)
 pub struct AppState {
-    /// 当前登录阶段
-    pub phase: RwLock<LoginPhase>,
-    /// 聊天数据
-    pub chat_data: RwLock<Option<ChatData>>,
-    /// 时间线数据
-    pub timeline: RwLock<TimelineState>,
-    /// 当前激活的 Tab
-    pub active_tab: RwLock<ActiveTab>,
+    /// 当前登录/加载阶段
+    pub phase: LoginPhase,
+    /// 当前激活 Tab
+    pub active_tab: ActiveTab,
+    /// 时间线状态
+    pub timeline: TimelineState,
+    /// 聊天状态
+    pub chat: ChatState,
     /// DM 未读数
-    pub dm_unread: RwLock<u64>,
+    pub dm_unread: u64,
 }
 
 pub struct TimelineState {
@@ -214,10 +390,10 @@ pub struct TimelineState {
     pub loading_more: bool,
 }
 
-/// 聊天数据 (从 viewmodel/chat_vm.rs 的 ChatData 迁移, 去掉 UI 字段)
-pub struct ChatData {
+/// 聊天状态 (纯业务数据)
+pub struct ChatState {
     pub contacts: Vec<Contact>,
-    pub loading: bool,
+    pub contacts_loading: bool,
     pub my_uid: String,
     pub selected_uid: Option<String>,
     pub messages: Vec<ChatMessage>,
@@ -226,665 +402,661 @@ pub struct ChatData {
     pub has_more: bool,
     pub emotions: Vec<Emotion>,
     pub group_info: Option<GroupInfo>,
-    // 去掉: input_focus, msg_list_state, chat_list_state (UI 相关)
-    // 去掉: draft_text, show_emoji_panel, search_text (前端管理)
+    // ❌ 不包含:
+    //   - ListState (GPUI 专属)
+    //   - FocusHandle (GPUI 专属)
+    //   - draft_text (前端 UI 局部状态)
+    //   - show_emoji_panel (前端 UI 局部状态)
+    //   - search_text (前端 UI 局部状态)
 }
 ```
 
-**关键设计决策**:
-- 去掉所有 `ListState`、`FocusHandle`、`px()` 等 GPUI UI 状态
-- `draft_text`、`show_emoji_panel`、`search_text` 等纯前端交互状态移至前端 store
-- 使用 `RwLock` 而非 `Mutex`，允许多个读取者并行 (事件推送 + command 查询)
-
-#### 1.2 创建 `events.rs` — 事件定义
-
-替代 `cx.notify()` 的推送机制:
+#### 3.4.2 `login_vm.rs` — 登录逻辑 (解耦后)
 
 ```rust
-// src-tauri/src/events.rs
-use serde::Serialize;
-use crate::domain::*;
+// crates/weibo-viewmodel/src/login_vm.rs
 
-/// 登录阶段变更事件
-#[derive(Clone, Serialize)]
-pub struct LoginPhaseChanged {
-    pub phase: LoginPhasePayload,
-}
+use weibo_domain::*;
+use weibo_model::auth_service;
+use crate::context::VMContext;
+use crate::app_state::AppState;
 
-#[derive(Clone, Serialize)]
-#[serde(tag = "type")]
-pub enum LoginPhasePayload {
-    CheckingCookie,
-    Loading { message: String },
-    WaitingScan { status: String, qr_base64: Option<String> },
-    Exchanging { message: String },
-    FetchingHome,
-    HomeLoaded { item_count: usize, title: String },
-    Error { message: String },
-}
-
-/// 新消息推送
-#[derive(Clone, Serialize)]
-pub struct NewMessage {
-    pub contact_uid: String,
-    pub message: ChatMessagePayload,
-}
-
-/// 聊天消息 (序列化版)
-#[derive(Clone, Serialize)]
-pub struct ChatMessagePayload {
-    pub id: String,
-    pub sender_id: String,
-    pub sender_name: String,
-    pub sender_avatar: String,
-    pub text: String,
-    pub timestamp: u64,
-    pub is_self: bool,
-    pub msg_type: String,
-    pub media_type: String,
-    pub fids: Vec<String>,
-    pub role: u8,
-}
-
-/// DM 未读数更新
-#[derive(Clone, Serialize)]
-pub struct DmUnreadChanged {
-    pub count: u64,
-}
-
-/// 联系人列表更新
-#[derive(Clone, Serialize)]
-pub struct ContactsLoaded {
-    pub contacts: Vec<ContactPayload>,
-}
-
-#[derive(Clone, Serialize)]
-pub struct ContactPayload {
-    pub user_id: String,
-    pub screen_name: String,
-    pub avatar: String,
-    pub unread_count: u64,
-    pub last_message: String,
-    pub last_time: String,
-    pub is_group: bool,
-}
-```
-
-#### 1.3 验收标准
-- [ ] `state.rs` 编译通过，所有字段类型与 domain 对齐
-- [ ] `events.rs` 所有事件类型可序列化 (`serde_json::to_string` 测试通过)
-- [ ] 编写单元测试验证 state 的读写锁行为
-
----
-
-### Phase 2: Tauri Commands 层 (预计 3 天)
-
-替代 viewmodel 中的异步流程编排，将 `cx.spawn` + `cx.notify` 模式转为 `#[tauri::command]` + `app.emit`。
-
-#### 2.1 `commands/auth.rs` — 登录命令
-
-替代 `login_vm.rs` + `home_vm.rs`:
-
-```rust
-// src-tauri/src/commands/auth.rs
-use tauri::{AppHandle, State, Emitter};
-use crate::state::AppState;
-use crate::model::{auth_service, timeline_service};
-use crate::events::*;
-
-/// 检查已保存的 Cookie 并自动登录
-#[tauri::command]
-pub async fn check_saved_cookie(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    // 对应 home_vm::start_cookie_flow
-    let cookie = auth_service::load_saved_cookie();
-    match cookie {
-        Some(cookie) => {
-            app.emit("login-phase-changed", LoginPhasePayload::Loading {
-                message: "验证 Cookie...".into()
-            }).ok();
-
-            let valid = auth_service::verify_cookie(&cookie).await.unwrap_or(false);
-            if valid {
-                // 加载首页
-                load_home_timeline(&app, &state).await;
-            } else {
-                app.emit("login-phase-changed", LoginPhasePayload::Loading {
-                    message: "Cookie 已过期, 请重新登录".into()
-                }).ok();
+/// 启动 QR 扫码登录全流程。
+pub fn start_login_flow<C: VMContext<State = AppState>>(ctx: &C) {
+    // Step 1: 获取 QR 码
+    ctx.spawn_task(
+        async { auth_service::prepare_qr().await },
+        |state, result| {
+            match result {
+                Ok((_login, png_bytes)) => {
+                    state.phase = LoginPhase::WaitingScan {
+                        status: "请用微博手机客户端扫描二维码".into(),
+                        qr_png_bytes: Some(png_bytes),
+                    };
+                    // TODO: 保存 login 实例用于后续 poll
+                    // 启动轮询 (见下方)
+                }
+                Err(e) => {
+                    state.phase = LoginPhase::Error(format!("连接失败: {}", e));
+                }
             }
-        }
-        None => {
-            app.emit("login-phase-changed", LoginPhasePayload::Loading {
-                message: "请扫码登录".into()
-            }).ok();
-        }
-    }
-    Ok(())
+        },
+    );
 }
 
-/// 启动 QR 扫码登录流程
-#[tauri::command]
-pub async fn start_qr_login(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    // 对应 login_vm::start_login_flow (拆分为多步)
-    // 1. prepare_qr
-    // 2. emit WaitingScan 事件 (附带 base64 QR 图片)
-    // 3. 轮询循环 (spawn 后台任务)
-    // 4. 确认后 exchange_ticket → load_home_timeline
-    todo!()
-}
-
-/// 登出
-#[tauri::command]
-pub async fn logout(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    crate::infra::cookie_io::delete();
-    *state.phase.write().await = LoginPhase::CheckingCookie;
-    app.emit("login-phase-changed", LoginPhasePayload::CheckingCookie).ok();
-    Ok(())
-}
-
-/// 内部辅助: 加载首页时间线
-async fn load_home_timeline(app: &AppHandle, state: &State<'_, AppState>) {
-    app.emit("login-phase-changed", LoginPhasePayload::FetchingHome).ok();
-    let (items, title, feed_list_id, since_id) = timeline_service::fetch_first_page().await;
-    // 更新 state
-    let mut tl = state.timeline.write().await;
-    tl.items = items;
-    tl.title = title.clone();
-    tl.since_id = since_id;
-    tl.feed_list_id = feed_list_id;
-    // 通知前端
-    app.emit("login-phase-changed", LoginPhasePayload::HomeLoaded {
-        item_count: tl.items.len(),
-        title,
-    }).ok();
+/// QR 轮询单次检查
+pub fn poll_qr_once<C: VMContext<State = AppState>>(ctx: &C, /* login state */) {
+    ctx.schedule_after(1000, |state| {
+        // 内部再 spawn 一次 poll
+        // ...
+    });
 }
 ```
 
-#### 2.2 `commands/chat.rs` — 聊天命令
-
-替代 `chat_vm.rs`:
+#### 3.4.3 `chat_vm.rs` — 聊天逻辑 (解耦后)
 
 ```rust
-// src-tauri/src/commands/chat.rs
+// crates/weibo-viewmodel/src/chat_vm.rs
+
+use weibo_domain::*;
+use weibo_model::chat_service;
+use crate::context::VMContext;
+use crate::app_state::AppState;
 
 /// 加载联系人列表
-#[tauri::command]
-pub async fn load_contacts(app: AppHandle, state: State<'_, AppState>) -> Result<Vec<ContactPayload>, String> {
-    let (contacts, my_info) = tokio::join!(
-        chat_service::fetch_contacts(),
-        chat_service::fetch_primary_info(),
+pub fn load_contacts<C: VMContext<State = AppState>>(ctx: &C) {
+    ctx.spawn_task(
+        async {
+            let contacts = chat_service::fetch_contacts().await.unwrap_or_default();
+            let my_info = chat_service::fetch_primary_info().await;
+            (contacts, my_info)
+        },
+        |state, (contacts, my_info)| {
+            state.chat.contacts = contacts;
+            state.chat.contacts_loading = false;
+            if let Some((uid, _)) = my_info {
+                state.chat.my_uid = uid;
+            }
+        },
     );
-    // 更新 state 并返回
-    todo!()
 }
 
-/// 选中一个联系人，加载消息历史
-#[tauri::command]
-pub async fn select_contact(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    uid: String,
-    is_group: bool,
-) -> Result<Vec<ChatMessagePayload>, String> {
-    // 对应 chat_vm::select_contact
-    todo!()
-}
-
-/// 加载更早消息 (分页)
-#[tauri::command]
-pub async fn load_older_messages(
-    state: State<'_, AppState>,
-    uid: String,
-    is_group: bool,
-) -> Result<Vec<ChatMessagePayload>, String> {
-    // 对应 chat_vm::load_more_messages
-    todo!()
+/// 选中联系人, 加载消息历史
+pub fn select_contact<C: VMContext<State = AppState>>(ctx: &C, uid: String, is_group: bool) {
+    let my_uid = /* from state */;
+    ctx.spawn_task(
+        async move {
+            chat_service::fetch_messages(&uid, &my_uid, is_group, None).await
+        },
+        |state, messages| {
+            state.chat.selected_uid = Some(uid);
+            state.chat.oldest_mid = messages.first().map(|m| m.id.clone());
+            state.chat.has_more = messages.len() >= 30;
+            state.chat.messages = messages;
+            state.chat.messages_loading = false;
+        },
+    );
 }
 
 /// 发送消息
-#[tauri::command]
-pub async fn send_message(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    uid: String,
-    text: String,
-    is_group: bool,
-) -> Result<Option<ChatMessagePayload>, String> {
-    // 对应 chat_vm::send_message
-    todo!()
-}
-
-/// 获取表情列表
-#[tauri::command]
-pub async fn fetch_emotions(state: State<'_, AppState>) -> Result<Vec<EmotionPayload>, String> {
-    todo!()
-}
-```
-
-#### 2.3 `commands/timeline.rs` — 时间线命令
-
-替代 `root_vm::try_load_more`:
-
-```rust
-// src-tauri/src/commands/timeline.rs
-
-/// 获取当前时间线数据
-#[tauri::command]
-pub async fn get_timeline(state: State<'_, AppState>) -> Result<TimelinePayload, String> {
-    todo!()
-}
-
-/// 加载更多时间线 (下拉加载)
-#[tauri::command]
-pub async fn load_more_timeline(state: State<'_, AppState>) -> Result<TimelinePayload, String> {
-    // 对应 root_vm::try_load_more
-    todo!()
-}
-```
-
-#### 2.4 WebSocket 监听 → Tauri Event
-
-替代 `root_vm` 中的 `cx.spawn` + `rx.recv()`:
-
-```rust
-// src-tauri/src/commands/chat.rs
-
-/// 启动 WebSocket 长连接 (在登录成功后调用)
-#[tauri::command]
-pub async fn start_websocket(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    let chat = state.chat_data.read().await;
-    let my_uid = chat.as_ref().map(|c| c.my_uid.clone()).unwrap_or_default();
-    drop(chat);
-
-    if my_uid.is_empty() { return Err("uid 不可用".into()); }
-
-    let mut rx = chat_service::start_ws(my_uid, /* handle */);
-
-    // 后台任务: 持续接收 WS 消息并 emit 事件
-    let app_clone = app.clone();
-    let state_inner = state.inner().clone();
-    tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            // 1. 更新 state.chat_data
-            // 2. emit "new-message" 事件给前端
-            app_clone.emit("new-message", NewMessage { ... }).ok();
-            // 3. 播放提示音
-            if !is_self {
-                crate::infra::audio::play_notification();
+pub fn send_message<C: VMContext<State = AppState>>(ctx: &C, uid: String, text: String, is_group: bool) {
+    ctx.spawn_task(
+        async move {
+            chat_service::send_message(&uid, &text, is_group).await
+        },
+        |state, sent| {
+            if let Some(msg) = sent {
+                state.chat.messages.push(msg);
             }
-        }
-    });
+        },
+    );
+}
 
+/// 加载更早消息
+pub fn load_older_messages<C: VMContext<State = AppState>>(ctx: &C) {
+    // ...
+}
+```
+
+#### 3.4.4 状态读取: ViewModel 如何在回调中读状态
+
+问题: `spawn_task` 的异步闭包需要从 state 中读取数据 (如 `my_uid`) 来构造请求参数。
+
+方案: 在调用 `spawn_task` 前从状态中提取所需参数:
+
+```rust
+pub fn select_contact<C: VMContext<State = AppState>>(
+    ctx: &C,
+    state: &AppState,      // ← 传入当前状态的不可变引用
+    uid: String,
+    is_group: bool,
+) {
+    let my_uid = state.chat.my_uid.clone(); // 提取后 move 进 async
+    ctx.spawn_task(
+        async move {
+            chat_service::fetch_messages(&uid, &my_uid, is_group, None).await
+        },
+        |state, messages| { /* ... */ },
+    );
+}
+```
+
+---
+
+### 3.5 `weibo-tauri` — Tauri 应用
+
+**Cargo.toml 依赖**:
+
+```toml
+[package]
+name = "weibo-tauri"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+weibo-domain = { path = "../weibo-domain" }
+weibo-infra = { path = "../weibo-infra" }
+weibo-model = { path = "../weibo-model" }
+weibo-viewmodel = { path = "../weibo-viewmodel" }
+
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+```
+
+#### 3.5.1 `tauri_context.rs` — impl VMContext for Tauri
+
+```rust
+// crates/weibo-tauri/src/tauri_context.rs
+
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tauri::{AppHandle, Emitter};
+
+use weibo_viewmodel::context::VMContext;
+use weibo_viewmodel::app_state::AppState;
+
+/// Tauri 对 VMContext 的实现
+pub struct TauriContext {
+    app: AppHandle,
+    state: Arc<RwLock<AppState>>,
+}
+
+impl TauriContext {
+    pub fn new(app: AppHandle, state: Arc<RwLock<AppState>>) -> Self {
+        Self { app, state }
+    }
+}
+
+impl VMContext for TauriContext {
+    type State = AppState;
+
+    fn notify(&self) {
+        // 把当前状态的摘要 emit 给前端
+        // (不发送全量状态, 只发变更事件, 前端按需 invoke 获取详情)
+        self.app.emit("state-changed", ()).ok();
+    }
+
+    fn spawn_task<F, T, C>(&self, task: F, on_done: C)
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+        C: FnOnce(&mut AppState, T) + Send + 'static,
+    {
+        let state = self.state.clone();
+        let app = self.app.clone();
+        tokio::spawn(async move {
+            let result = task.await;
+            let mut s = state.write().await;
+            on_done(&mut s, result);
+            app.emit("state-changed", ()).ok();
+        });
+    }
+
+    fn schedule_after<C>(&self, millis: u64, callback: C)
+    where
+        C: FnOnce(&mut AppState) + Send + 'static,
+    {
+        let state = self.state.clone();
+        let app = self.app.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+            let mut s = state.write().await;
+            callback(&mut s);
+            app.emit("state-changed", ()).ok();
+        });
+    }
+}
+```
+
+#### 3.5.2 `commands/` — Tauri IPC 命令 (薄封装)
+
+```rust
+// crates/weibo-tauri/src/commands/auth.rs
+
+use tauri::State;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use weibo_viewmodel::{app_state::AppState, login_vm, home_vm};
+use crate::tauri_context::TauriContext;
+
+pub struct ManagedState {
+    pub state: Arc<RwLock<AppState>>,
+    pub ctx: Arc<TauriContext>,
+}
+
+/// 前端调用: 检查保存的 Cookie
+#[tauri::command]
+pub async fn check_saved_cookie(managed: State<'_, ManagedState>) -> Result<(), String> {
+    let state = managed.state.read().await;
+    home_vm::check_cookie(&*managed.ctx, &state);
     Ok(())
 }
+
+/// 前端调用: 启动扫码登录
+#[tauri::command]
+pub async fn start_qr_login(managed: State<'_, ManagedState>) -> Result<(), String> {
+    login_vm::start_login_flow(&*managed.ctx);
+    Ok(())
+}
+
+/// 前端调用: 获取当前状态快照 (前端初始化/同步用)
+#[tauri::command]
+pub async fn get_state(managed: State<'_, ManagedState>) -> Result<StateSnapshot, String> {
+    let state = managed.state.read().await;
+    Ok(StateSnapshot::from(&*state))
+}
 ```
 
-#### 2.5 Tauri 入口 `main.rs`
+**设计要点**: Tauri command 只是一层薄封装，真正的逻辑在 `weibo-viewmodel` 中。
+
+#### 3.5.3 `main.rs`
 
 ```rust
-// src-tauri/src/main.rs
-mod commands;
-mod domain;
-mod events;
-mod infra;
-mod model;
-mod qr_login;
-mod state;
-#[macro_use]
-mod logger;
+// crates/weibo-tauri/src/main.rs
 
-use state::AppState;
+mod commands;
+mod events;
+mod tauri_context;
+
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use weibo_viewmodel::app_state::AppState;
+use tauri_context::TauriContext;
+use commands::ManagedState;
 
 fn main() {
+    // TLS provider
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::aws_lc_rs::default_provider()
     );
 
     tauri::Builder::default()
-        .manage(AppState::new())
+        .setup(|app| {
+            let state = Arc::new(RwLock::new(AppState::new()));
+            let ctx = Arc::new(TauriContext::new(app.handle().clone(), state.clone()));
+            app.manage(ManagedState { state, ctx });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::auth::check_saved_cookie,
             commands::auth::start_qr_login,
-            commands::auth::logout,
+            commands::auth::get_state,
             commands::chat::load_contacts,
             commands::chat::select_contact,
-            commands::chat::load_older_messages,
             commands::chat::send_message,
-            commands::chat::fetch_emotions,
-            commands::chat::start_websocket,
+            commands::chat::load_older_messages,
             commands::timeline::get_timeline,
             commands::timeline::load_more_timeline,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .expect("启动 Tauri 应用失败");
 }
 ```
 
-#### 2.6 验收标准
-- [ ] 所有 `#[tauri::command]` 编译通过
-- [ ] 为每个 command 编写单元测试 (mock AppHandle)
-- [ ] `cargo test` 通过
-
 ---
 
-### Phase 3: domain 层适配 (预计 0.5 天)
+## 四、QR 登录轮询的特殊处理
 
-#### 3.1 为所有 domain 类型添加 Serialize/Deserialize
+QR 轮询是一个 **长生命周期的异步循环** (prepare → poll → poll → ... → confirm → exchange)。
+它需要跨多次 `spawn_task` 保持 `QrLogin` 实例的状态。
+
+### 4.1 方案: 将 QrLogin 存入 AppState
 
 ```rust
-// domain/mod.rs — 所有结构体添加:
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct Contact { ... }
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub enum LoginPhase { ... }
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct ChatMessage { ... }
-
-// ... 所有 pub 类型
-```
-
-#### 3.2 注意事项
-- `LoginPhase::WaitingScan.qr_png_bytes` 改为 `qr_base64: Option<String>` (WebView 中用 base64 显示图片)
-- 或者保持 `Vec<u8>` 在后端, 在 event payload 中转为 base64
-
-#### 3.3 验收标准
-- [ ] 所有 domain 类型可以 `serde_json::to_string` 序列化
-- [ ] 编写测试验证序列化/反序列化往返一致
-
----
-
-### Phase 4: 前端框架搭建 (预计 1 天)
-
-#### 4.1 项目初始化
-
-```bash
-# 前端依赖
-npm install vue@3 vue-router@4 pinia @tauri-apps/api
-npm install -D typescript vite @vitejs/plugin-vue tailwindcss autoprefixer
-npm install vue-virtual-scroller  # 虚拟滚动
-```
-
-#### 4.2 TypeScript 类型定义
-
-```typescript
-// src/types/index.ts — 与 domain/ 对应
-export interface Contact {
-  user_id: string;
-  screen_name: string;
-  avatar: string;
-  unread_count: number;
-  last_message: string;
-  last_time: string;
-  is_group: boolean;
+// app_state.rs
+pub struct AppState {
+    // ...
+    /// QR 登录会话 (仅在登录流程中有值)
+    pub qr_session: Option<QrSession>,
 }
 
-export interface ChatMessage {
-  id: string;
-  sender_id: string;
-  sender_name: string;
-  sender_avatar: string;
-  text: string;
-  timestamp: number;
-  is_self: boolean;
-  msg_type: 'Normal' | 'System' | 'Recall' | { Other: number };
-  media_type: 'Text' | 'Image' | 'Quote' | { Other: number };
-  fids: string[];
-  role: number;
+pub struct QrSession {
+    pub login: weibo_model::QrLogin,  // QR 登录协议状态机
+    pub polling: bool,                 // 是否正在轮询
 }
-
-export interface TimelineItem {
-  user_name: string;
-  text: string;
-}
-
-export type LoginPhase =
-  | { type: 'CheckingCookie' }
-  | { type: 'Loading'; message: string }
-  | { type: 'WaitingScan'; status: string; qr_base64: string | null }
-  | { type: 'Exchanging'; message: string }
-  | { type: 'FetchingHome' }
-  | { type: 'HomeLoaded'; item_count: number; title: string }
-  | { type: 'Error'; message: string };
 ```
 
-#### 4.3 Pinia Store 设计
+### 4.2 轮询实现
 
-```typescript
-// src/stores/auth.ts
-export const useAuthStore = defineStore('auth', () => {
-  const phase = ref<LoginPhase>({ type: 'CheckingCookie' });
-  const isLoggedIn = computed(() => phase.value.type === 'HomeLoaded');
+```rust
+// login_vm.rs
 
-  async function checkCookie() { await invoke('check_saved_cookie'); }
-  async function startQrLogin() { await invoke('start_qr_login'); }
-  async function logout() { await invoke('logout'); }
+/// 启动登录: prepare → 显示 QR → 开始轮询
+pub fn start_login_flow<C: VMContext<State = AppState>>(ctx: &C) {
+    ctx.spawn_task(
+        async { auth_service::prepare_qr().await },
+        |state, result| {
+            match result {
+                Ok((login, png_bytes)) => {
+                    state.phase = LoginPhase::WaitingScan { ... };
+                    state.qr_session = Some(QrSession { login, polling: true });
+                    // 启动轮询定时器 (1 秒后)
+                    schedule_next_poll(ctx);
+                }
+                Err(e) => state.phase = LoginPhase::Error(...),
+            }
+        },
+    );
+}
 
-  // 监听后端事件
-  function setupListeners() {
-    listen<LoginPhase>('login-phase-changed', (event) => {
-      phase.value = event.payload;
+/// 调度下一次轮询
+fn schedule_next_poll<C: VMContext<State = AppState>>(ctx: &C) {
+    ctx.schedule_after(1000, |state| {
+        if let Some(ref session) = state.qr_session {
+            if session.polling {
+                // 再次 spawn 一次 poll 请求
+                do_poll_once(ctx, state);
+            }
+        }
     });
-  }
-
-  return { phase, isLoggedIn, checkCookie, startQrLogin, logout, setupListeners };
-});
-
-// src/stores/chat.ts
-export const useChatStore = defineStore('chat', () => {
-  const contacts = ref<Contact[]>([]);
-  const selectedUid = ref<string | null>(null);
-  const messages = ref<ChatMessage[]>([]);
-  const draftText = ref('');           // 纯前端状态
-  const showEmojiPanel = ref(false);   // 纯前端状态
-  const searchText = ref('');          // 纯前端状态
-
-  async function loadContacts() { ... }
-  async function selectContact(uid: string, isGroup: boolean) { ... }
-  async function sendMessage() { ... }
-  async function loadOlderMessages() { ... }
-
-  function setupListeners() {
-    listen<NewMessage>('new-message', (event) => {
-      // 追加消息、更新联系人预览
-    });
-  }
-
-  return { contacts, selectedUid, messages, draftText, ... };
-});
-```
-
-#### 4.4 路由配置
-
-```typescript
-// src/router/index.ts
-const routes = [
-  { path: '/login', component: LoginView },
-  { path: '/', component: () => import('@/views/HomeView.vue') },
-  { path: '/chat', component: () => import('@/views/ChatView.vue') },
-];
-```
-
-#### 4.5 验收标准
-- [ ] `npm run dev` 前端开发服务器启动
-- [ ] 基础路由跳转工作正常
-- [ ] Pinia store 可以调用 Tauri invoke (即使后端还是 todo)
-
----
-
-### Phase 5: 前端视图实现 (预计 4-5 天)
-
-#### 5.1 视图对应关系
-
-| GPUI (旧) | Vue (新) | 功能 |
-|-----------|---------|------|
-| `view/app_shell.rs` | `App.vue` + `router` | 窗口骨架 + 路由 |
-| `view/screens/root_screen.rs` | `App.vue` (tabs + body) | Tab 栏 + 内容路由 |
-| `view/screens/login_screen.rs` | `views/LoginView.vue` | 登录界面 |
-| `view/screens/home_screen.rs` | `views/HomeView.vue` | 时间线首页 |
-| `view/screens/chat_screen.rs` | `views/ChatView.vue` | 聊天界面 |
-| `view/widgets/header_bar.rs` | `components/HeaderBar.vue` | 顶部状态栏 |
-| `view/widgets/contact_card.rs` | `components/ContactCard.vue` | 联系人卡片 |
-| `view/widgets/message_bubble.rs` | `components/MessageBubble.vue` | 消息气泡 |
-| `view/widgets/timeline_card.rs` | `components/TimelineCard.vue` | 时间线卡片 |
-| `view/widgets/qr_display.rs` | `components/QrDisplay.vue` | QR 码显示 |
-| `view/widgets/emoji_panel.rs` | `components/EmojiPanel.vue` | 表情面板 |
-| `view/widgets/member_sidebar.rs` | `components/MemberSidebar.vue` | 群成员侧栏 |
-| `view/widgets/centered_msg.rs` | `components/CenteredMsg.vue` | 居中提示文字 |
-| `view/theme.rs` | `styles/theme.css` | 主题色值 |
-
-#### 5.2 关键组件实现要点
-
-**LoginView.vue:**
-- 监听 `login-phase-changed` 事件切换 UI 状态
-- QR 图片用 `<img :src="'data:image/png;base64,' + qrBase64" />`
-- 状态提示文字响应式更新
-
-**ChatView.vue (最复杂):**
-- 联系人列表: 虚拟滚动 (`vue-virtual-scroller`)
-- 消息列表: 虚拟滚动 + 滚动到底部 + 向上滚动加载历史
-- 输入框: `v-model` + Ctrl+Enter 发送
-- WebSocket 消息实时追加
-
-**HomeView.vue:**
-- 时间线卡片列表: 虚拟滚动
-- 无限滚动加载更多
-
-#### 5.3 主题迁移
-
-```css
-/* src/styles/theme.css — 对应 view/theme.rs */
-:root {
-  --clr-bg: #0d1b2a;
-  --clr-text: #e0e6ed;
-  --clr-accent: #4fc3f7;
-  --clr-muted: #5a7a9a;
-  --clr-card: #1b2838;
-  --clr-surface: #152238;
-  /* ... */
 }
 ```
 
-#### 5.4 验收标准
-- [ ] 登录页: QR 码显示、状态切换、自动跳转
-- [ ] 首页: 时间线列表渲染、无限滚动
-- [ ] 聊天: 联系人列表、消息列表、发送消息、表情面板
-- [ ] WebSocket: 实时收到新消息
+### 4.3 问题: `schedule_after` 回调中无法再调 `ctx`
 
----
+`schedule_after` 的回调签名是 `FnOnce(&mut State)`，此时没有 `ctx` 可用。
 
-### Phase 6: 集成测试 & 清理 (预计 1 天)
-
-#### 6.1 端到端验证
-
-- [ ] 冷启动: 无 Cookie → QR 扫码 → 首页加载
-- [ ] 热启动: 有 Cookie → 自动登录 → 首页加载
-- [ ] 聊天: 选择联系人 → 查看历史 → 发送消息 → 收到推送
-- [ ] 登出: 点击登出 → 回到扫码界面
-- [ ] 时间线: 滚动加载更多
-
-#### 6.2 清理旧代码
-
-- [ ] 删除 `src/view/` 目录 (全部 GPUI 渲染代码)
-- [ ] 删除 `src/viewmodel/` 目录 (已被 commands/ 替代)
-- [ ] 从 Cargo.toml 移除 `gpui`、`wry`、`tao` 依赖
-- [ ] 删除 `build.rs` (如果只是为 gpui 服务的)
-- [ ] 更新 `main.rs` 入口
-
-#### 6.3 验收标准
-- [ ] 无残留 GPUI 代码
-- [ ] `cargo clippy` 无 warning
-- [ ] `npm run build` 前端构建通过
-- [ ] `cargo tauri build` 打包成功
-
----
-
-## 五、风险与注意事项
-
-### 5.1 model 层的 `block_on` 调用
-
-当前 model 层的函数是 `async fn`，但在 viewmodel 中通过 `handle.block_on()` 调用。
-迁移到 Tauri 后，`#[tauri::command]` 本身支持 `async`，可以直接 `.await`，不再需要 `block_on`。
-
-**变化**:
-```rust
-// 旧: handle.block_on(auth_service::verify_cookie(&cookie))
-// 新: auth_service::verify_cookie(&cookie).await
-```
-
-### 5.2 QR 轮询机制
-
-GPUI 中用 `Timer::after(Duration::from_secs(1)).await` + 循环实现。
-Tauri 中改为 `tokio::time::sleep` + `app.emit` 通知前端进度:
+**解决方案**: 在 VMContext trait 中增加一个方法，让回调可以继续调度:
 
 ```rust
-loop {
-    let status = auth_service::poll_qr(&login).await;
-    match status { ... }
-    tokio::time::sleep(Duration::from_secs(1)).await;
+pub trait VMContext: Send + Sync + 'static {
+    type State: Send + 'static;
+
+    fn notify(&self);
+
+    fn spawn_task<F, T, C>(&self, task: F, on_done: C) where ...;
+
+    fn schedule_after<C>(&self, millis: u64, callback: C) where ...;
+
+    /// 获取 Context 的克隆 (Arc 包装), 用于在回调中继续调度。
+    fn clone_ctx(&self) -> Arc<dyn VMContext<State = Self::State>>;
 }
 ```
 
-### 5.3 image crate 用途
-
-当前 `image = "0.25"` 仅用于 QR 码 PNG 解码 (生成 GPUI 可用的 RGBA 数据)。
-迁移后，QR 码直接以 base64 PNG 传给前端 `<img>` 标签，**可能不再需要** image crate。
-
-### 5.4 CLI 模式保留
-
-`cli/` 模块 (终端 QR 登录、Cookie 登录) 与 UI 无关，保持不变。
-可以在 `main.rs` 中用命令行参数判断是否走 CLI 模式:
+然后:
 
 ```rust
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    match args.get(1).map(|s| s.as_str()) {
-        Some("cookie") => { /* CLI cookie login */ }
-        Some("http") => { /* CLI QR login */ }
-        _ => { /* Tauri GUI mode */ }
+pub fn start_login_flow(ctx: &Arc<dyn VMContext<State = AppState>>) {
+    let ctx2 = ctx.clone();
+    ctx.spawn_task(
+        async { auth_service::prepare_qr().await },
+        move |state, result| {
+            // ...
+            schedule_next_poll(&ctx2);  // ← 可以继续调度
+        },
+    );
+}
+```
+
+或者更优雅的方案：让 `spawn_task` 的回调同时接收 `ctx`:
+
+```rust
+pub trait VMContext: Send + Sync + 'static {
+    type State: Send + 'static;
+
+    fn notify(&self);
+
+    /// 回调同时接收 &dyn VMContext, 允许链式调度
+    fn spawn_task<F, T, C>(&self, task: F, on_done: C)
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+        C: FnOnce(&mut Self::State, T, &dyn VMContext<State = Self::State>) + Send + 'static;
+
+    fn schedule_after<C>(&self, millis: u64, callback: C)
+    where
+        C: FnOnce(&mut Self::State, &dyn VMContext<State = Self::State>) + Send + 'static;
+}
+```
+
+**最终签名** (推荐):
+
+```rust
+// 回调中可以继续 spawn / schedule, 实现多步异步链
+ctx.spawn_task(
+    async { auth_service::prepare_qr().await },
+    |state, result, ctx| {      // ← 第三个参数是 ctx 自身
+        state.phase = LoginPhase::WaitingScan { ... };
+        schedule_next_poll(ctx); // 继续调度
+    },
+);
+```
+
+---
+
+## 五、测试策略
+
+### 5.1 MockContext — 用于 ViewModel 单元测试
+
+```rust
+// crates/weibo-viewmodel/src/context.rs (或 tests/ 中)
+
+#[cfg(test)]
+pub struct MockContext {
+    state: std::cell::RefCell<AppState>,
+    notified: std::cell::Cell<u32>,
+}
+
+#[cfg(test)]
+impl VMContext for MockContext {
+    type State = AppState;
+
+    fn notify(&self) {
+        self.notified.set(self.notified.get() + 1);
+    }
+
+    fn spawn_task<F, T, C>(&self, task: F, on_done: C)
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+        C: FnOnce(&mut AppState, T, &dyn VMContext<State = AppState>) + Send + 'static,
+    {
+        // 测试中同步执行:
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(task);
+        on_done(&mut self.state.borrow_mut(), result, self);
+    }
+
+    fn schedule_after<C>(&self, _millis: u64, callback: C)
+    where
+        C: FnOnce(&mut AppState, &dyn VMContext<State = AppState>) + Send + 'static,
+    {
+        // 测试中立即执行:
+        callback(&mut self.state.borrow_mut(), self);
     }
 }
 ```
 
-### 5.5 音频播放
+**测试示例**:
 
-`infra/audio.rs` 使用 `rodio`，与 UI 框架无关，可以直接在 Tauri 后端的 WS 消息处理中调用。
+```rust
+#[test]
+fn test_login_flow_sets_waiting_scan() {
+    let ctx = MockContext::new(AppState::new());
+    login_vm::start_login_flow(&ctx);
+    assert!(matches!(ctx.state().phase, LoginPhase::WaitingScan { .. }));
+    assert!(ctx.notified() > 0);
+}
+```
 
-### 5.6 跨平台注意
+### 5.2 各层测试范围
 
-- Tauri 2.x 在 Linux 上使用 WebKitGTK，需确保开发环境安装了相关依赖
-- 字体渲染: 原 GPUI 指定 "Microsoft YaHei"，Web 中可用 `font-family` CSS 自适应
-
----
-
-## 六、工作量总结
-
-| Phase | 内容 | 预估工时 | 依赖 |
-|-------|------|---------|------|
-| 0 | 项目初始化 + 模块搬迁 | 1 天 | 无 |
-| 1 | AppState + Events 定义 | 2 天 | Phase 0 |
-| 2 | Tauri Commands 实现 | 3 天 | Phase 1 |
-| 3 | domain 序列化适配 | 0.5 天 | Phase 0 |
-| 4 | 前端框架搭建 | 1 天 | Phase 0 |
-| 5 | 前端视图实现 | 4-5 天 | Phase 2, 3, 4 |
-| 6 | 集成测试 + 清理 | 1 天 | Phase 5 |
-| **总计** | | **12-13 天** | |
-
-**可并行**: Phase 3 + Phase 4 可与 Phase 1-2 并行开发。
+| Crate | 测试重点 | 方式 |
+|---|---|---|
+| `weibo-domain` | 序列化/反序列化、枚举转换 | 普通单元测试 |
+| `weibo-infra` | HTTP mock、WS 协议解析 | `mockito` + 单元测试 |
+| `weibo-model` | 业务逻辑、API 解析 | mock infra + 单元测试 |
+| `weibo-viewmodel` | **状态变迁、流程编排** | MockContext + 同步执行 |
+| `weibo-tauri` | IPC 集成 | Tauri test utils + e2e |
 
 ---
 
-## 七、迁移策略
+## 六、分阶段实施计划
 
-采用 **平行开发** 而非逐步替换:
+### Phase 0: Workspace 骨架 (1 天)
 
-1. 在项目根目录新建 `src-tauri/` 和前端 `src/` (Tauri 标准结构)
-2. 旧的 `src/` 重命名为 `src-gpui/` 保留作为参考
-3. 两套代码共存期间，用 git branch 隔离
-4. 新版本功能对齐后，删除旧代码，合入主分支
+- [ ] 创建 `weibo-rs/` 目录结构
+- [ ] 创建 workspace `Cargo.toml`
+- [ ] 创建 5 个 crate 的 `Cargo.toml` (均可编译, 内容为空 lib)
+- [ ] 验收: `cargo build --workspace` 编译通过
 
-这样做的好处:
-- 旧版本随时可用 (切回 branch)
-- 不会因为半成品导致项目不可用
-- 可以逐个功能对比验证
+### Phase 1: 搬迁无耦合层 (1 天)
+
+- [ ] `weibo-domain`: 从 `src/domain/mod.rs` 搬入，拆分文件，加 Serialize
+- [ ] `weibo-infra`: 从 `src/infra/` 搬入，调整 `use` 路径
+- [ ] `weibo-model`: 从 `src/model/` + `src/qr_login.rs` 搬入，调整 `use` 路径
+- [ ] 验收: `cargo test -p weibo-domain -p weibo-infra -p weibo-model` 通过
+
+### Phase 2: VMContext trait + AppState (2 天)
+
+- [ ] 编写 `context.rs` — 完整 trait 签名 (含回调中的 ctx 参数)
+- [ ] 编写 `app_state.rs` — 纯状态结构
+- [ ] 编写 MockContext
+- [ ] 验收: `cargo build -p weibo-viewmodel` 通过
+
+### Phase 3: ViewModel 逻辑迁移 (3 天)
+
+- [ ] `login_vm.rs` — QR 登录全流程 (prepare → poll → exchange → home)
+- [ ] `home_vm.rs` — Cookie 验证 + 首页加载
+- [ ] `chat_vm.rs` — 联系人加载、选中、发送、加载更多、WS 消息处理
+- [ ] 为每个 vm 编写单元测试 (MockContext)
+- [ ] 验收: `cargo test -p weibo-viewmodel` 全部通过
+
+### Phase 4: Tauri 应用壳 (2 天)
+
+- [ ] 创建 `weibo-tauri` crate + `tauri.conf.json`
+- [ ] 实现 `TauriContext` (impl VMContext)
+- [ ] 实现 `commands/` (薄封装，调用 viewmodel 函数)
+- [ ] 实现 `events.rs` (状态序列化 payload)
+- [ ] `main.rs` 组装
+- [ ] 验收: `cargo tauri dev` 能启动窗口，后端命令可被调用
+
+### Phase 5: 前端实现 (4-5 天)
+
+- [ ] Vue 3 + Vite + Tailwind 初始化
+- [ ] TypeScript 类型对齐 domain
+- [ ] Pinia store + Tauri invoke/listen
+- [ ] 视图组件逐个实现 (Login → Home → Chat)
+- [ ] 虚拟滚动 (消息列表、联系人列表、时间线)
+- [ ] 验收: 完整功能流程跑通
+
+### Phase 6: 集成验证 + 清理 (1 天)
+
+- [ ] 端到端测试: 冷启动、热启动、聊天、登出
+- [ ] 删除旧 `src/` 中的 GPUI 代码
+- [ ] 更新 CLAUDE.md、README
+- [ ] 验收: workspace 干净编译, 无遗留 gpui 引用
+
+---
+
+## 七、从旧代码到新代码的映射表
+
+### 7.1 文件级映射
+
+| 旧文件 | 新位置 | 改动 |
+|---|---|---|
+| `src/domain/mod.rs` | `crates/weibo-domain/src/*.rs` | 拆分 + 加 Serialize |
+| `src/infra/*.rs` | `crates/weibo-infra/src/*.rs` | 调整 use 路径 |
+| `src/model/*.rs` | `crates/weibo-model/src/*.rs` | 调整 use 路径 |
+| `src/qr_login.rs` | `crates/weibo-model/src/qr_login.rs` | 调整 use 路径 |
+| `src/logger.rs` | `crates/weibo-infra/src/logger.rs` | 宏跨 crate 导出 |
+| `src/viewmodel/root_vm.rs` | `crates/weibo-viewmodel/src/app_state.rs` | 提取纯状态，移除 GPUI |
+| `src/viewmodel/login_vm.rs` | `crates/weibo-viewmodel/src/login_vm.rs` | 用 VMContext 重写 |
+| `src/viewmodel/home_vm.rs` | `crates/weibo-viewmodel/src/home_vm.rs` | 用 VMContext 重写 |
+| `src/viewmodel/chat_vm.rs` | `crates/weibo-viewmodel/src/chat_vm.rs` | 用 VMContext 重写 |
+| `src/view/*.rs` (全部) | `frontend/src/` (Vue 组件) | 完全重写为 HTML/CSS/JS |
+| `src/view/theme.rs` | `frontend/src/styles/theme.css` | 色值搬迁 |
+| `src/main.rs` | `crates/weibo-tauri/src/main.rs` | Tauri 入口 |
+| (新增) | `crates/weibo-viewmodel/src/context.rs` | VMContext trait |
+| (新增) | `crates/weibo-tauri/src/tauri_context.rs` | impl VMContext |
+| (新增) | `crates/weibo-tauri/src/commands/*.rs` | Tauri IPC |
+
+### 7.2 概念级映射
+
+| GPUI 概念 | 新架构中的对应 |
+|---|---|
+| `Entity<AppRoot>` | `Arc<RwLock<AppState>>` (Tauri managed) |
+| `WeakEntity<AppRoot>` | `Arc<RwLock<AppState>>` (clone) |
+| `cx.notify()` | `VMContext::notify()` → `app.emit(...)` |
+| `cx.spawn(\|this, cx\| async { this.update(...) })` | `VMContext::spawn_task(async_fn, callback)` |
+| `Timer::after(dur).await` | `VMContext::schedule_after(ms, callback)` |
+| `ListState` | 前端 vue-virtual-scroller 组件 |
+| `FocusHandle` | 前端 `ref` + `focus()` |
+| `Render trait` | Vue 组件 `<template>` |
+| `div().flex().px_4().child(...)` | HTML + Tailwind `<div class="flex px-4">` |
+| `cx.listener(\|this, event, ...\|)` | Tauri command + Pinia action |
+
+---
+
+## 八、Workspace Cargo.toml
+
+```toml
+# weibo-rs/Cargo.toml
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/weibo-domain",
+    "crates/weibo-infra",
+    "crates/weibo-model",
+    "crates/weibo-viewmodel",
+    "crates/weibo-tauri",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# 共享依赖版本统一管理
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+```
+
+---
+
+## 九、风险与决策记录
+
+| 风险 | 影响 | 缓解措施 |
+|---|---|---|
+| VMContext trait 泛型过复杂 | 编译错误难调试 | 先用关联类型，避免 dyn trait object |
+| QR 轮询需要跨多次 spawn 保持状态 | 设计复杂度 | QrLogin 存入 AppState |
+| logger 宏跨 crate 导出 | 编译问题 | 在 infra crate 用 `#[macro_export]`, 其他 crate 用 `weibo_infra::log_info!` |
+| model 层的 `async fn` + Tauri 的 tokio runtime | 运行时冲突 | Tauri 2.x 自带 tokio runtime，model 直接 `.await` |
+| 前端状态与后端状态同步 | 数据不一致 | 单向数据流: 后端 emit → 前端 listen, 前端 invoke → 后端更新 |
+
+---
+
+## 十、最终架构优势
+
+1. **ViewModel 可独立测试** — MockContext 同步执行，无需启动任何 UI 框架
+2. **UI 可替换** — 未来若要换回原生 UI (如 iced、slint)，只需实现新的 VMContext
+3. **编译隔离** — 改前端不重编译 ViewModel；改 ViewModel 不重编译 infra/model
+4. **关注点分离清晰** — 每个 crate 职责单一，依赖方向单向向下
+5. **符合 TDD** — 先写 VMContext trait + MockContext + 测试，再接 Tauri 实现

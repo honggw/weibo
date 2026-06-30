@@ -1,0 +1,21 @@
+[package]
+name = "weibo-tauri"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+weibo-domain = { path = "../weibo-domain" }
+weibo-infra = { path = "../weibo-infra" }
+weibo-model = { path = "../weibo-model" }
+weibo-viewmodel = { path = "../weibo-viewmodel" }
+
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+tokio = { version = "1", features = ["full"] }
+rustls = "0.23"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }

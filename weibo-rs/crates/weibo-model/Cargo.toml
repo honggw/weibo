@@ -1,0 +1,16 @@
+[package]
+name = "weibo-model"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+weibo-domain = { path = "../weibo-domain" }
+weibo-infra = { path = "../weibo-infra" }
+anyhow = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["cookies", "json"] }
+serde = { version = "1", features = ["derive"] }
+url = "2"
+base64 = "0.22"
+open = "5"

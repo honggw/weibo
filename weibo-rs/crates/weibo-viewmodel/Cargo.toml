@@ -1,0 +1,14 @@
+[package]
+name = "weibo-viewmodel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+weibo-domain = { path = "../weibo-domain" }
+weibo-model = { path = "../weibo-model" }
+weibo-infra = { path = "../weibo-infra" }
+anyhow = "1"
+
+# 注意: 不依赖任何 UI 框架!
+# 仅需 tokio 的 sync feature (用于 WS 消息转发)
+tokio = { version = "1", features = ["sync"] }

@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/weibo-domain",
+    "crates/weibo-infra",
+    "crates/weibo-model",
+    "crates/weibo-viewmodel",
+    "crates/weibo-tauri",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# 共享依赖版本统一管理
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
